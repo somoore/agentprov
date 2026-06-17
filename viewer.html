@@ -439,9 +439,10 @@ function applyReveal(){
 function te(s){ return esc(s==null?"":String(s)); }
 function termLine(x){
   const n=x.n;
-  // condense multi-line content to a single representative line + a +N count.
-  const firstLine=s=>{ s=(s||"").replace(/\t/g," ").trim(); const i=s.indexOf("\n"); return i<0?s:s.slice(0,i); };
-  const moreLines=s=>{ const m=((s||"").match(/\n/g)||[]).length; return m>0?` <span class="tdim">… +${m} lines</span>`:""; };
+  // first line for the tool header; full body indented under the ⎿ connector.
+  const firstLine=s=>{ s=(s||"").replace(/\t/g,"  "); const i=s.indexOf("\n"); return (i<0?s:s.slice(0,i)).trim(); };
+  // indent every line of a multi-line block to sit under the ⎿ connector.
+  const indentBlock=(s,pad)=>te(s).split("\n").join("\n"+pad);
 
   if(n.op==="prompt")
     // user turn — Claude Code shows it as a '>' block, full text, light.
@@ -456,18 +457,23 @@ function termLine(x){
     return `\n<span class="tsub">⏺ Task</span><span class="tdim">(${te(n.agent)})</span>`;
 
   if(n.op==="tool_call"){
-    // ⏺ Tool(condensed args)   — the signature Claude Code tool header
+    // ⏺ Tool(full args) — full command/args, not just the first line.
     const name=n.attrs&&n.attrs.mcp ? te(n.tool).replace(/^mcp__[^_]+(?:_[^_]+)*__/,"") : te(n.tool);
     const srv=n.attrs&&n.attrs.mcp?`<span class="tsub">${te(n.attrs.mcp)}:</span>`:"";
-    const arg=firstLine(n.detail);
-    const head=`<span class="ttool">⏺</span> <span class="tname">${srv}${name}</span><span class="tdim">(${te(arg).slice(0,120)})</span>`;
-    if(n.net) return head+`\n  <span class="tres">⎿</span>  <span class="tnet">→ ${te(n.net)}</span>`;
+    // single-line args inline in parens; multi-line args as an indented block.
+    const d=n.detail||"";
+    let argHTML;
+    if(d.includes("\n")) argHTML=`<span class="tdim">(</span>\n  <span class="tdim">${indentBlock(d.trim(),"  ")}</span>\n<span class="tdim">)</span>`;
+    else argHTML=`<span class="tdim">(${te(d)})</span>`;
+    let head=`<span class="ttool">⏺</span> <span class="tname">${srv}${name}</span>${argHTML}`;
+    if(n.net) head+=`\n  <span class="tres">⎿</span>  <span class="tnet">→ ${te(n.net)}</span>`;
     return head;
   }
 
   if(n.op==="tool_result"){
-    const fl=te(firstLine(n.detail)).slice(0,140);
-    return `  <span class="tres">⎿  ${fl}${moreLines(n.detail)}</span>`;
+    // full output, every line indented to sit under the ⎿ connector.
+    const body=indentBlock(n.detail||"","     ");
+    return `  <span class="tres">⎿  ${body}</span>`;
   }
   if(n.op==="image")
     return `  <span class="tres">⎿  ${te(n.detail)}</span>`;
@@ -514,20 +520,38 @@ function footerHTML(){
   return `<div class="tfooter"><span>${cursor+1}/${timeline.length} events · ${clk}</span>`+
     `<span class="eff"><span class="dot"></span>verified chain · /agentprov</span></div>`;
 }
+// rendered = index of the last node currently in the DOM. We APPEND on forward
+// play (O(1) per tick) and only fully rebuild when seeking backward — otherwise
+// rebuilding seq 0..cursor every tick on uncapped content freezes the page.
+let rendered=-1;
+function lineHTML(i){
+  const seg=termLine(timeline[i]);
+  return seg?seg+"\n":"";
+}
+function fullRebuild(){
+  let body="";
+  for(let i=0;i<=cursor && i<timeline.length;i++) body+=lineHTML(i);
+  $("#termpre").innerHTML=body+`<span class="tbreak" id="tbreakmark"></span><span class="tcur"> </span>`;
+  rendered=cursor;
+}
 function renderTerminal(){
   const pre=$("#termpre");
-  let body="";
-  for(let i=0;i<=cursor && i<timeline.length;i++){
-    const seg=termLine(timeline[i]);
-    if(seg) body+=seg+"\n";
+  if(cursor<rendered || rendered<0){
+    fullRebuild();
+  }else if(cursor>rendered){
+    // append only the newly revealed nodes before the cursor/break markers
+    let add="";
+    for(let i=rendered+1;i<=cursor;i++) add+=lineHTML(i);
+    const cur=pre.querySelector(".tcur"), brk=pre.querySelector("#tbreakmark");
+    cur.insertAdjacentHTML("beforebegin",add);
+    rendered=cursor;
   }
+  // break marker: show only when the cursor is exactly on the break node
   const cur=timeline[cursor];
-  if(cur && (cur.n.seq===(lastRes.fb>=0?allNodes[lastRes.fb]?.seq:null)))
-    body+=`<span class="tbreak">✗ CHAIN BREAKS HERE — record altered. Nothing below can be trusted.</span>\n`;
-  body+=`<span class="tcur"> </span>`; // blinking cursor
-  pre.innerHTML=body;
+  const brk=pre.querySelector("#tbreakmark");
+  if(brk) brk.innerHTML = (cur && cur.n.seq===(lastRes.fb>=0?allNodes[lastRes.fb]?.seq:null))
+    ? `✗ CHAIN BREAKS HERE — record altered. Nothing below can be trusted.\n` : "";
   pre.scrollTop=pre.scrollHeight;
-  // banner above the scrolling pre, footer below — set once, cheap to rewrite.
   $("#tbannerSlot").innerHTML=bannerHTML();
   $("#tfooterSlot").innerHTML=footerHTML();
 }
@@ -549,7 +573,7 @@ function enterReplay(){
   replayOn=true; buildTimeline();
   $("#replayModal").classList.remove("hidden");
   $("#rbscrub").max=Math.max(0,timeline.length-1);
-  cursor=0; renderTicks(); applyReveal();
+  cursor=0; rendered=-1; renderTicks(); applyReveal();
 }
 function exitReplay(){
   replayOn=false; pause();

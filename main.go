@@ -526,7 +526,13 @@ func flatten(v any) string {
 	}
 }
 
-const detailMax = 600
+// detailMax is the per-node content ceiling. Set high enough to carry full
+// prompts, commands, and tool output verbatim — a responder must be able to
+// recreate exactly what happened, and the injection/exfil evidence often lives
+// well past a short cap. Content is hashed, so it stays tamper-evident.
+// ponytail: 20k-char ceiling, not unbounded — caps a pathological 50MB `cat`
+// dump from bloating the chain; raise or spill-to-sidecar only if real runs hit it.
+const detailMax = 20000
 
 // isCommandEnvelope reports whether a "user" transcript line is actually a
 // slash-command / local-command / tooling wrapper rather than text the human
