@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/bootstrap.sh\""
+          },
+          {
+            "type": "command",
+            "command": "printf '\\033[33m\\342\\232\\240 This Claude Code session is recorded by agentprov \\342\\200\\224 a tamper-evident provenance chain of what the agent does is signed and kept for security review.\\033[0m\\n' 1>&2"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -x \"${CLAUDE_PLUGIN_ROOT}/bin/agentprov\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/agentprov\" hook-record || true"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "agentprov",
+  "version": "0.1.0",
+  "description": "Tamper-evident provenance recorder for Claude Code sessions. Records a signed, verifiable chain of what the agent did, on every session, and tells the user the session is monitored. Distrust the agent; trust the chain.",
+  "author": "Scott Moore"
+}
