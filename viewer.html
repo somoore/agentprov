@@ -83,6 +83,7 @@
   .subhead{background:rgba(255,180,80,.12);border-left:3px solid #f0a850;border-radius:0 6px 6px 0;}
   .subhead .txt{color:#f5c47a;font-weight:600;}
   .sub{margin-left:26px;border-left:2px solid rgba(240,168,80,.35);}
+  .mcp{color:#c79bff;font:11px/1 var(--mono);background:rgba(170,120,255,.14);border:1px solid rgba(170,120,255,.35);border-radius:4px;padding:2px 6px;margin-right:6px;}
   .net{color:#7be3a3;font:12px/1.4 var(--mono);background:rgba(80,220,140,.10);border:1px solid rgba(80,220,140,.3);border-radius:4px;margin:6px 0 0;padding:5px 8px;word-break:break-all;}
   .detail{color:var(--dim);font:12px/1.45 var(--mono);background:rgba(255,255,255,.04);border-left:2px solid var(--dim);margin:6px 0 0;padding:7px 9px;white-space:pre-wrap;word-break:break-word;border-radius:0 4px 4px 0;
     overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:1;max-height:1.6em;}
@@ -169,7 +170,7 @@ async function analyze(nodes){
 }
 
 // classify which nodes are "the story" vs "plumbing"
-const STORY=new Set(["prompt","tool_call","tool_result","assistant","subagent"]);
+const STORY=new Set(["prompt","tool_call","tool_result","assistant","subagent","image"]);
 function isPlumbing(n){ return !STORY.has(n.op) && n.op!=="heartbeat"; }
 
 function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
@@ -177,6 +178,7 @@ function label(n){
   if(n.op==="prompt") return "🧑 HUMAN → agent";
   if(n.op==="assistant") return "🤖 agent";
   if(n.op==="subagent") return "↳ SUBAGENT spawned — "+esc(n.agent||"");
+  if(n.op==="image") return "🖼 image uploaded (untrusted input)";
   if(n.op==="tool_result") return "tool output (untrusted — external content enters here)";
   if(n.op==="heartbeat") return esc(n.summary||"recorder heartbeat");
   return esc(n.summary||n.op);
@@ -197,7 +199,11 @@ function nodeEl(n,i,broken,why){
   if(isPlumbing(n))cls+=" plumbing";
   if(broken)cls+=" broken";
   el.className=cls;
-  const tool=n.op==="tool_call"&&n.tool?`<span class="tool">${esc(n.tool)}</span>`:"";
+  const mcp=n.attrs&&n.attrs.mcp;
+  let toolName=n.tool||"";
+  if(mcp) toolName=toolName.replace(/^mcp__[^_]+(?:_[^_]+)*__/,""); // strip mcp__server__ prefix
+  const mcpBadge=mcp?`<span class="mcp">🔌 ${esc(mcp)}</span>`:"";
+  const tool=n.op==="tool_call"&&n.tool?`${mcpBadge}<span class="tool">${esc(toolName)}</span>`:"";
   const whyhtml=broken?`<div class="why">⚠ CHAIN BREAKS HERE — ${esc(why)}. Nothing below can be trusted.</div>`:"";
   const nethtml=n.net?`<div class="net">🌐 NETWORK → ${esc(n.net)}</div>`:"";
   const detailhtml=n.detail?`<pre class="detail">${esc(n.detail)}</pre>`:"";

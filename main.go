@@ -499,6 +499,11 @@ func flatten(v any) string {
 		}
 		return strings.Join(parts, " ")
 	case map[string]any:
+		// An image block anywhere (e.g. a screenshot returned in a tool_result)
+		// must NEVER have its base64 surfaced — describe it instead.
+		if t, _ := x["type"].(string); t == "image" {
+			return imageDetail(x["source"])
+		}
 		for _, k := range []string{"text", "thinking", "content", "command", "output", "stdout"} {
 			if s, ok := x[k]; ok {
 				return flatten(s)
@@ -564,6 +569,37 @@ func netHost(tool, detail string) string {
 	return ""
 }
 
+// imageDetail describes an uploaded image WITHOUT carrying its bytes.
+func imageDetail(source any) string {
+	s, _ := source.(map[string]any)
+	media, _ := s["media_type"].(string)
+	if media == "" {
+		media = "image"
+	}
+	if data, ok := s["data"].(string); ok {
+		// base64 decodes to ~3/4 its length; good enough for "how big".
+		return fmt.Sprintf("🖼 image uploaded — %s, ~%d KB", media, len(data)*3/4/1024)
+	}
+	if url, ok := s["url"].(string); ok {
+		return "🖼 image (url) — " + truncRunes(url, 100)
+	}
+	return "🖼 image uploaded — " + media
+}
+
+// mcpServer pulls the server name out of an MCP tool name (mcp__<server>__<tool>).
+// Returns "" for non-MCP tools. This is the "which MCP server did the agent talk
+// to" signal — MCP output is a top prompt-injection entry point.
+func mcpServer(tool string) string {
+	if !strings.HasPrefix(tool, "mcp__") {
+		return ""
+	}
+	rest := strings.TrimPrefix(tool, "mcp__")
+	if i := strings.Index(rest, "__"); i > 0 {
+		return rest[:i]
+	}
+	return ""
+}
+
 func normalize(raw map[string]any) []Node {
 	if uuid, ok := raw["uuid"].(string); ok { // Claude Code
 		parent, _ := raw["parentUuid"].(string)
@@ -583,6 +619,9 @@ func normalize(raw map[string]any) []Node {
 				n.Summary = "tool_use " + n.Tool
 				n.Detail = truncRunes(flatten(b["input"]), detailMax)
 				n.Net = netHost(n.Tool, n.Detail)
+				if srv := mcpServer(n.Tool); srv != "" {
+					n.Attrs = map[string]string{"mcp": srv}
+				}
 				nodes = append(nodes, n)
 			case "tool_result":
 				n := base
@@ -601,6 +640,14 @@ func normalize(raw map[string]any) []Node {
 				n.Op, n.Trust, n.Summary = "assistant", "trusted", "agent thinking"
 				think, _ := b["thinking"].(string)
 				n.Detail = truncRunes(think, detailMax)
+				nodes = append(nodes, n)
+			case "image":
+				// An image entered the context. NEVER carry the base64 payload
+				// (it would bloat the chain and broke hashing before); record
+				// that an image arrived, its media type, and its size.
+				n := base
+				n.Op, n.Trust, n.Summary = "image", "untrusted", "image input"
+				n.Detail = imageDetail(b["source"])
 				nodes = append(nodes, n)
 			}
 		}
@@ -651,6 +698,9 @@ func normalize(raw map[string]any) []Node {
 			n.Summary = "tool_call " + n.Tool
 			n.Detail = truncRunes(flatten(payload["arguments"]), detailMax)
 			n.Net = netHost(n.Tool, n.Detail)
+			if srv := mcpServer(n.Tool); srv != "" {
+				n.Attrs = map[string]string{"mcp": srv}
+			}
 		case "function_call_output", "custom_tool_call_output", "patch_apply_end":
 			// tool RESULTS are where untrusted content (file/web/MCP) enters.
 			n.Op, n.Trust, n.Summary = "tool_result", "untrusted", "tool_result"
