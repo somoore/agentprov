@@ -82,6 +82,22 @@ liveness:   ⚠ GAP DETECTED — no clean-exit heartbeat. The run was truncated 
             was silenced mid-run. A plain log would look complete here; this does not.
 ```
 
+## See it — `agentprov view`
+
+```bash
+$ agentprov view chain.jsonl
+```
+
+Opens a browser flight-recorder viewer: the causal chain drawn node by node, trust-colored
+(trusted agent actions vs. the untrusted points where external content enters), with the
+integrity and liveness verdicts up top. **The viewer recomputes the same hash chain the CLI
+does** (SHA-256 over the identical field layout) — so when you `tamper` or `drop` a node, the
+chain *visibly fractures* at exactly the right place, and a silenced run *shows the gap*. It's
+the real verification rendered, not a mockup; it invents nothing the recorder doesn't prove.
+
+The viewer is one self-contained HTML file, embedded in the binary — no build step, no
+dependencies, no network.
+
 ## What it records
 
 Each node is a provenance event with a **trust label**:
@@ -112,6 +128,7 @@ instrumentation (macOS Endpoint Security / Linux eBPF) and root — a deliberate
 agentprov run -- <agent...>      live: wrap a real agent, record, verify on exit
 agentprov record <transcript>    record a past Claude/Codex transcript JSONL
 agentprov verify <chain.jsonl>   integrity + signatures + coverage + liveness
+agentprov view   [chain.jsonl]   open the browser flight-recorder viewer
 agentprov tamper <chain> <seq>   demo: alter a node so verify fails
 agentprov drop   <chain> <seq>   demo: drop a node so verify fails
 ```

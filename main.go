@@ -17,6 +17,7 @@
 //   agentprov run -- <agent...>          # launch a real agent, record it LIVE, verify on exit
 //   agentprov record <transcript.jsonl>  # record a past transcript (claude/codex)
 //   agentprov verify <chain.jsonl>       # integrity + signatures + liveness + coverage
+//   agentprov view   [chain.jsonl]       # open the chain in a browser flight-recorder viewer
 //   agentprov tamper <chain.jsonl> <seq> # demo: alter one node  -> verify must fail
 //   agentprov drop   <chain.jsonl> <seq> # demo: delete one node -> verify must fail
 //
@@ -68,6 +69,12 @@ func run(args []string) error {
 			return errors.New("usage: agentprov verify <chain.jsonl>")
 		}
 		return cmdVerify(args[1])
+	case "view":
+		path := "chain.jsonl"
+		if len(args) > 1 {
+			path = args[1]
+		}
+		return cmdView(path)
 	case "tamper":
 		return cmdMutate(args[1], args[2], false)
 	case "drop":

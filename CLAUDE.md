@@ -42,6 +42,14 @@ Any change here must preserve all three — they ARE the product:
   spots honestly (off-transcript subprocess egress needs the privileged ES/eBPF tier).
 - `cmdMutate` (`tamper`/`drop`) — the demo harness that proves verify fails on a forged/dropped
   node. This is how the README demo and any test must exercise integrity.
+- `cmdView` (`view.go`) + `viewer.html` (embedded via `go:embed`) — serves the chain + viewer on
+  loopback and opens a browser. The viewer is a PURE RENDERER: its JS recomputes `contentHash`
+  with the EXACT same field layout (`seq\x00prev\x00op\x00span\x00parent\x00tool\x00trust\x00summary\x00time`
+  then sorted `\x00k=v` attrs) so the browser verdict is real verification, byte-for-byte with Go
+  (cross-checked). If you ever change `contentHash`, change `hashInput` in viewer.html identically.
+  The viewer must visualize ONLY what the deterministic recorder proves — chain, breaks, gaps. Do
+  NOT add severity scores, risk colors, or any probabilistic/invented signal to it; that's the
+  exact reason IFC was removed. Keep it deterministic and honest.
 
 ## Commands
 
