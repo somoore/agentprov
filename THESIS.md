@@ -97,10 +97,14 @@ claude/codex  ->  user/home IP  ->  native OTLP  ->  WAF  ->  API Gateway  ->  L
                                                                                   |  1. decode protobuf
                                                                                   |  2. redact (deterministic: pattern-match secrets/PII/PAN — NOT judgment)
                                                                                   |  3. HASH-CHAIN + SIGN     <- integrity established at ingest, in their boundary
-                                                                                  |  4. FAN OUT (dumb, no judgment, no filtering):
-                                                                                  +--> HEC -> SIEM            (analyst's existing world: Splunk / CrowdStrike / Sentinel)
-                                                                                  +--> customer-owned sink   (S3 default; Security Lake/OCSF optional)
+                                                                                  |  4. FAN OUT (dumb, no judgment, no filtering — rate CONSERVED 1:1):
+                                                                                  +--> HEC -> SIEM                  (analyst's existing world: Splunk / CrowdStrike / Sentinel)
+                                                                                  +--> Kinesis Firehose -> S3      (our fork; Firehose absorbs the conserved rate, batches to S3)
 ```
+
+(See "The receiving tier on OUR fork" below for why Firehose, not S3-direct or a DB, on the
+high-rate fork. S3 is still the resting place / system of record; Firehose is the shock absorber
+in front of it. Security Lake/OCSF remains an optional alternate sink for customers who run it.)
 
 This reuses Scott's existing, proven Lambda (decode + redact + HEC). The ONE new step is
 hash-chain + sign before fan-out. Signing key in the Lambda's KMS/Secrets Manager — unreachable
@@ -139,6 +143,78 @@ or you lose the "we never touch your data outside your boundary" trust win.
 "Read the customer's existing SIEM as your source" is itself a proven, mainstream pattern (the
 entire 2025-26 AI-SOC category: Dropzone, Prophet, Radiant; SIEMs ship purpose-built query APIs
 for it). Fork-at-Lambda is the lower-latency, scale-friendly variant of the same posture.
+
+### The receiving tier on OUR fork (the architecture-correctness decision)
+
+The concern that drove this: **what receives our fork without us owning a capacity tier that
+falls over under load?** The load is REQUEST RATE, not bytes. Key facts established:
+
+- **Volume is tiny** (~1MB/day/client metadata stream; ~3GB/mo at 100 clients = pennies). Storage
+  cost is a non-issue. **The real constraint is request rate, not storage.**
+- **The rate is CONSERVED, 1:1, end to end.** One OTLP event in -> one Lambda invocation ->
+  one transform -> one write to EACH destination. Lambda scales to *survive* the rate but does
+  NOT *shrink* it (no batching/culling; malformed reqs are rejected at WAF/API-GW before Lambda,
+  a rounding error). So our sink sees the FULL per-event rate (thousands/sec sustained), same as
+  HEC does. (Earlier claim that "Lambda absorbs/calms the rate before the fork" was WRONG.)
+- **Therefore the receiver must absorb the conserved per-event rate as a MANAGED service we own
+  no capacity for.** Ranked: S3 can take the rate but one-tiny-object-per-event at thousands/sec
+  is an anti-pattern (per-PUT cost + millions of tiny objects). A DATABASE on the path is the
+  foot-gun (Lambda->RDS connection storms; RDS Proxy exists because this is a known problem) —
+  this is the capacity-bottleneck-you-own risk, correctly flinched at. EC2/ECS/EKS = you operate
+  the scaling tier = max risk.
+
+**Answer: Kinesis Data Firehose is the missing shock-absorber.** It accepts the conserved
+per-event rate (fully managed, zero capacity for us to own), BUFFERS/BATCHES by size or time,
+and delivers tidy batched objects to S3. Cheap (~$0.029/GB; negligible at this volume). It is
+the purpose-built tier between a high-rate 1:1 source and a sink that doesn't want one-object-
+per-event.
+
+```
+Lambda (1:1, per event) --fork--> HEC -> SIEM
+                          \------> Kinesis Firehose --(buffer/batch)--> S3 (batched session objects)
+```
+
+The PRINCIPLE: the receiving tier must be a managed service we cannot overwhelm; anything with a
+capacity ceiling WE own (a DB, a compute pool) must live BEHIND the fork, fed at a rate we
+control — never exposed to the conserved firehose.
+
+### What we do with it (processing = mostly LAZY, at investigation time)
+
+"Process" is four distinct jobs at different times. Only one runs in the background:
+
+1. **Verify the chain (deterministic — the verdict).** Recompute the hash chain for a session.
+   Done **ON-READ, lazily** — only when a human/incident actually looks at a session. You don't
+   prove integrity of a session nobody's reading; you prove it at the moment it matters. Fast
+   (SHA-256 over one session). Kills an always-on verification tier.
+2. **Promote a thin queryable INDEX into Postgres (the only background job, and it's small).**
+   S3 batch lands -> S3 event -> tiny loader Lambda -> upsert session METADATA rows into Postgres
+   (who/when/which agent/repo/#tool-calls/integrity-status/gap-or-not). Loaded per-batch at a
+   CONTROLLED rate, so the DB never sees the per-event firehose — connection-storm risk avoided
+   by construction. **Postgres is the searchable index of sessions; S3 is the full record.**
+3. **Surface it (read-time, on-demand).** Dashboard/console-app/viewer queries Postgres to FIND
+   the session worth investigating, then fetches full events from S3 for that session. No
+   background compute.
+4. **Analyze it (off-path, labeled, optional, on-demand).** AI summaries, "find similar sessions"
+   — runs WHEN an analyst asks, never continuously, never a verdict. pgvector (added to the same
+   Postgres) is the lazy embedding path; embed only the sliver investigated, not the firehose.
+
+```
+Firehose -> S3 (batched events = durable, complete record)
+              |-- S3 event -> loader Lambda -> Postgres   [job 2: thin metadata index, per-batch, cheap]
+              \-- on-demand at investigation time (no background compute):
+                    analyst opens dashboard -> query Postgres -> pick a session ->
+                      fetch full events from S3 -> VERIFY chain [job1] -> render [job3]
+                      -> optional AI summary / similar-session retrieval [job4, labeled, off-path]
+```
+
+The whole model is the flight-recorder principle applied to compute: **record everything cheaply
+now (Firehose->S3), process the sliver you investigate later.** The ONLY always-on processing is
+the small per-batch loader Lambda. Everything expensive or probabilistic (verify, analyze, embed)
+is lazy, at read-time, on a tiny working set.
+
+DECISION (default): Postgres holds session METADATA only (enough to find a session); full events
++ verification come from S3 on click. Load richer event content into Postgres only IF analysts
+need to query across event bodies ("every session that ran curl"). Start minimal.
 
 ### Read / analysis plane (probabilistic — OFF the critical path)
 
@@ -185,6 +261,13 @@ Meet the buyer in the console they already use. Researched install surfaces:
 5. **Differentiation is vertical depth + integrity, not "AI SOC analyst" (saturated).** Generalist
    AI-SOC tools read everything shallowly; agentprov reads AGENT telemetry deeply with a tamper-
    evidence guarantee none of them offer. Depth in a vertical + the integrity chain is the wedge.
+6. **The receiving tier on our fork must be un-overwhelmable (managed); capacity-bounded tiers we
+   own (DB, compute) live BEHIND the fork, fed at a rate we control.** The per-event rate is
+   conserved 1:1 through the Lambda — Firehose absorbs it and batches to S3; Postgres sits behind
+   S3, loaded per-batch, never exposed to the firehose.
+7. **Process lazily, at investigation time.** Flight-recorder principle applied to compute:
+   capture everything cheaply now, verify/analyze/embed the sliver you investigate later. The only
+   always-on processing is a tiny per-batch metadata-loader Lambda; everything else is on-read.
 
 ### Status of this architecture
 
