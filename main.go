@@ -61,6 +61,11 @@ func run(args []string) error {
 	switch args[0] {
 	case "demo":
 		return cmdDemo()
+	case "attach-cast":
+		if len(args) < 3 {
+			return errors.New("usage: agentprov attach-cast <chain.jsonl> <session.cast>")
+		}
+		return cmdAttachCast(args[1], args[2])
 	case "run":
 		return cmdRun(args[1:])
 	case "record":
@@ -200,6 +205,67 @@ func writePubFile(pub ed25519.PublicKey) error {
 }
 
 // ── live run: wrap a real agent ────────────────────────────────────────────
+
+// cmdAttachCast binds a real terminal recording (asciinema .cast) to an existing
+// chain by appending a signed node that commits to the recording's SHA-256. The
+// recording itself is NOT tamper-proof — the agent renders to the TTY and could
+// lie — but the chain commits to its hash, so it becomes tamper-EVIDENT: the
+// .cast can't be swapped after the fact, and the verified chain's tool_results
+// can be cross-checked against what the TTY claimed. Two cameras on one run.
+func cmdAttachCast(chainPath, castPath string) error {
+	nodes, err := loadChain(chainPath)
+	if err != nil {
+		return err
+	}
+	if len(nodes) == 0 {
+		return errors.New("empty chain")
+	}
+	castBytes, err := os.ReadFile(castPath)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(castBytes)
+	castHash := hex.EncodeToString(sum[:])
+
+	priv, pub, keySource, err := loadOrCreateSigningKey()
+	if err != nil {
+		return err
+	}
+	if err := writePubFile(pub); err != nil {
+		return err
+	}
+	// copy the recording next to the chain so the viewer can load it by name.
+	castName := "session.cast"
+	if err := os.WriteFile(castName, castBytes, 0o600); err != nil {
+		return err
+	}
+
+	// re-open the chain for append, positioned at the tail hash/seq.
+	f, err := os.OpenFile(chainPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	tail := nodes[len(nodes)-1]
+	rec := newRecorder(bufio.NewWriter(f), priv)
+	rec.seq = tail.Seq + 1
+	rec.prev = tail.Hash
+	rec.emit(Node{
+		Op:      "cast_recording",
+		Summary: "real terminal recording (asciinema) — reconstruction's untrusted sibling",
+		Attrs: map[string]string{
+			"sha256": castHash,
+			"file":   castName,
+			"bytes":  fmt.Sprintf("%d", len(castBytes)),
+			"key":    keySource,
+		},
+	})
+	rec.w.Flush()
+	fmt.Printf("attached %s (%d bytes) to %s\n", castName, len(castBytes), chainPath)
+	fmt.Printf("  sha256: %s\n", castHash)
+	fmt.Printf("  the chain now commits to this recording — swap it and verify fails.\n")
+	return nil
+}
 
 func cmdRun(args []string) error {
 	if len(args) > 0 && args[0] == "--" {
@@ -736,7 +802,9 @@ func cmdVerify(path string) error {
 	cleanExit := false
 	keySource := "unknown"
 	var egress []string
-	for _, n := range nodes {
+	var castNode *Node
+	for i := range nodes {
+		n := nodes[i]
 		if n.Net != "" {
 			who := n.Agent
 			if who == "" {
@@ -767,6 +835,9 @@ func cmdVerify(path string) error {
 				cleanExit = true
 			}
 		}
+		if n.Op == "cast_recording" {
+			castNode = &nodes[i]
+		}
 		prev = n.Hash
 	}
 
@@ -777,6 +848,7 @@ func cmdVerify(path string) error {
 		fmt.Printf("provenance: signed by %s key (tamper-evident; keychain unavailable -> not bound away from the agent)\n", keySource)
 	}
 	printNetwork(egress)
+	printCast(castNode)
 	printCoverage()
 	if !cleanExit {
 		fmt.Printf("liveness:   ⚠ GAP DETECTED — no clean-exit heartbeat. The run was truncated or the recorder\n")
@@ -804,6 +876,36 @@ func printNetwork(egress []string) {
 
 // printCoverage states, honestly, what this tier of the recorder can and cannot
 // see. Honest coverage map > false completeness — the credibility move.
+// printCast checks an attached real terminal recording against the hash the
+// chain committed to. The recording is the untrusted sibling of the verified
+// replay — it can show whatever the agent rendered to the TTY — but the chain
+// commits to its SHA-256, so a swapped recording is caught here.
+func printCast(n *Node) {
+	if n == nil {
+		return
+	}
+	committed := n.Attrs["sha256"]
+	file := n.Attrs["file"]
+	if file == "" {
+		file = "session.cast"
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		fmt.Printf("recording:  ⚠ committed (%s) but %s not found — recording missing\n", short(committed), file)
+		return
+	}
+	sum := sha256.Sum256(data)
+	got := hex.EncodeToString(sum[:])
+	if got != committed {
+		fmt.Printf("recording:  ✗ ALTERED — %s no longer matches the hash the chain committed to\n", file)
+		fmt.Printf("            committed %s, on disk %s. The recording was swapped after the run.\n", short(committed), short(got))
+		return
+	}
+	fmt.Printf("recording:  ✓ real terminal recording present and matches the chain (%s)\n", file)
+	fmt.Printf("            note: this is the agent's self-rendered TTY — watchable ground truth, but\n")
+	fmt.Printf("            NOT forgery-proof. The verified replay above is. Cross-check the two.\n")
+}
+
 func printCoverage() {
 	fmt.Println("coverage:")
 	fmt.Println("  ✓ covered  : prompts, tool calls, tool results, run start/end (agent self-reported transcript)")
