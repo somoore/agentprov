@@ -249,6 +249,7 @@
 
     <div id="verifiedPane">
       <div class="rbnote">⚠ Reconstruction, not a recording — replayed from the signed event chain (UTC timestamps, idle-compressed). Not a screen/disk capture. Every line is a hashed event in the forensic list behind this.</div>
+      <div id="emptyNote" style="display:none;padding:18px;color:#cbb890;font:13px/1.6 var(--mono);background:rgba(217,164,65,.08);border:1px solid rgba(217,164,65,.3);border-radius:8px;margin-bottom:12px;"></div>
       <div class="term" id="term">
         <div class="termchrome" id="tbannerSlot"></div>
         <div id="termpre"></div>
@@ -638,7 +639,13 @@ function enterReplay(){
   renderTicks(); applyReveal();
   // show the verified/real switch only when a real recording is attached.
   $("#modeswitch").classList.toggle("hidden", !castNode);
-  showMode("verified");
+  // if there are no replayable story events, say so instead of a dead play button.
+  const storyCount=timeline.filter(x=>x.n&&x.n.op!=="heartbeat").length;
+  $("#emptyNote").style.display=storyCount?"none":"block";
+  $("#emptyNote").innerHTML = castNode
+    ? "No agent transcript was recorded in this run, so there's nothing to replay here — but a real terminal recording exists. Switch to <b>▶ Real recording</b> above to watch it."
+    : "No replayable events in this chain (it has no prompts, tool calls, or agent turns).";
+  showMode(castNode && !storyCount ? "real" : "verified");  // jump straight to the recording if that's all there is
 }
 function exitReplay(){
   replayOn=false; pause();
