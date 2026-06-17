@@ -36,6 +36,34 @@ var asciinemaJS []byte
 //go:embed web/asciinema-player.css
 var asciinemaCSS []byte
 
+//go:embed web/font/JetBrainsMono-Regular.ttf
+var fontRegular []byte
+
+//go:embed web/font/JetBrainsMono-Bold.ttf
+var fontBold []byte
+
+// fontDir writes the embedded JetBrains Mono fonts to a temp dir so agg can use
+// them — JetBrains Mono (Apache 2.0) covers the glyphs Claude's TUI uses (❯,
+// box-drawing, powerline) that system fonts like Menlo render as blobs. Returns
+// "" if the write fails (agg then falls back to a system font).
+func fontDir() string {
+	dir := filepath.Join(os.TempDir(), "agentprov-fonts")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return ""
+	}
+	reg := filepath.Join(dir, "JetBrainsMono-Regular.ttf")
+	bold := filepath.Join(dir, "JetBrainsMono-Bold.ttf")
+	if _, err := os.Stat(reg); err != nil {
+		if os.WriteFile(reg, fontRegular, 0o644) != nil {
+			return ""
+		}
+	}
+	if _, err := os.Stat(bold); err != nil {
+		_ = os.WriteFile(bold, fontBold, 0o644)
+	}
+	return dir
+}
+
 // cmdDemo is the zero-install proof: write the bundled sample transcript, record
 // it to a chain, verify it clean, then tell the user the one command that breaks
 // it. Works with no Claude/Codex install and no transcript of their own.
@@ -83,22 +111,40 @@ func renderVideo(castPath, format string) (outPath, contentType string, err erro
 	dir := filepath.Dir(castPath)
 	base := strings.TrimSuffix(filepath.Base(castPath), filepath.Ext(castPath))
 	gifPath := filepath.Join(dir, base+".gif")
+
+	// Render from a SANITIZED COPY of the cast, never the original: agg draws a
+	// non-breaking space (U+00A0, which Claude's prompt emits) as a visible box.
+	// We replace nbsp with a normal space for the video only. The signed/served
+	// cast stays byte-exact — we never alter the evidence to make the video look
+	// nicer; we render a cosmetically-cleaned copy.
+	renderSrc := castPath
+	if raw, e := os.ReadFile(castPath); e == nil {
+		cleaned := strings.ReplaceAll(string(raw), " ", " ")
+		if cleaned != string(raw) {
+			tmp := filepath.Join(os.TempDir(), "agentprov-render-"+base+".cast")
+			if os.WriteFile(tmp, []byte(cleaned), 0o600) == nil {
+				renderSrc = tmp
+				defer os.Remove(tmp)
+			}
+		}
+	}
 	// Tuned for TUI fidelity: a high FPS cap so the agent's in-place repaints
 	// (spinners, token counters) land on settled frames rather than mid-paint,
 	// a real terminal monospace font with proper box-drawing glyphs, and a
 	// short idle cap so we don't dwell on dead frames. Residual smearing on a
 	// line that's repainting at the captured instant is inherent to flattening
 	// a TUI to video — these flags minimize it.
-	aggArgs := []string{
-		"--fps-cap", "30",
-		"--idle-time-limit", "2",
-		"--font-family", aggFont(),
-		"--font-size", "16",
-		castPath, gifPath,
+	aggArgs := []string{"--fps-cap", "30", "--idle-time-limit", "2", "--font-size", "16"}
+	if fd := fontDir(); fd != "" {
+		// bundled JetBrains Mono — crisp ❯, box-drawing, powerline glyphs.
+		aggArgs = append(aggArgs, "--font-dir", fd, "--font-family", "JetBrains Mono")
+	} else {
+		aggArgs = append(aggArgs, "--font-family", aggFont())
 	}
+	aggArgs = append(aggArgs, renderSrc, gifPath)
 	if out, e := exec.Command(agg, aggArgs...).CombinedOutput(); e != nil {
-		// retry without the font flag in case the chosen font isn't present.
-		if out2, e2 := exec.Command(agg, "--fps-cap", "30", "--idle-time-limit", "2", castPath, gifPath).CombinedOutput(); e2 != nil {
+		// retry bare (no font flags) if the bundled/system font is rejected.
+		if out2, e2 := exec.Command(agg, "--fps-cap", "30", "--idle-time-limit", "2", renderSrc, gifPath).CombinedOutput(); e2 != nil {
 			return "", "", fmt.Errorf("agg failed: %v\n%s\n%s", e, out, out2)
 		}
 	}
