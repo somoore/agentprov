@@ -42,6 +42,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -128,6 +129,7 @@ func contentHash(prev string, n Node) string {
 // lives in the keychain; the recorder holds it for its lifetime but it never
 // touches disk or the agent's environment.
 type recorder struct {
+	mu   sync.Mutex
 	w    *bufio.Writer
 	priv ed25519.PrivateKey
 	prev string
@@ -139,6 +141,8 @@ func newRecorder(w *bufio.Writer, priv ed25519.PrivateKey) *recorder {
 }
 
 func (r *recorder) emit(n Node) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	n.Seq = r.seq
 	n.PrevHash = r.prev
 	n.Hash = contentHash(r.prev, n)
@@ -322,7 +326,19 @@ func cmdRun(args []string) error {
 
 	// Run the agent in a PTY so the interactive session renders normally AND
 	// every byte it paints is teed into the .cast — our own real recording.
-	waitErr := runInPTY(cmd, castPath)
+	// Idle/resume boundaries (45s no human input) are recorded into the chain.
+	hooks := ptyHooks{
+		onIdle: func(t time.Time) {
+			rec.emit(Node{Op: "idle_gap", Summary: "human went idle — no input for 45s; recording paused",
+				Time: t.UTC().Format(time.RFC3339), Attrs: map[string]string{"reason": "no_human_input"}})
+		},
+		onResume: func(idleStart, resume time.Time) {
+			rec.emit(Node{Op: "resume", Summary: "human input resumed; recording continued",
+				Time: resume.UTC().Format(time.RFC3339),
+				Attrs: map[string]string{"idle_seconds": fmt.Sprintf("%.0f", resume.Sub(idleStart).Seconds())}})
+		},
+	}
+	waitErr := runInPTY(cmd, castPath, hooks)
 
 	time.Sleep(300 * time.Millisecond) // let the tail drain final lines
 	select {

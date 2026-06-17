@@ -19,9 +19,12 @@ import (
 // chain recorder). The header keeps a unix start timestamp so the relative
 // event times can later be aligned to the chain's absolute UTC.
 type castWriter struct {
-	mu    sync.Mutex
-	f     *os.File
-	start time.Time
+	mu         sync.Mutex
+	f          *os.File
+	start      time.Time
+	paused     bool
+	pausedAt   time.Time
+	pausedTotal time.Duration // total idle time excluded from the timeline
 }
 
 func newCastWriter(path string, cols, rows int, startUnix int64) (*castWriter, error) {
@@ -40,15 +43,39 @@ func newCastWriter(path string, cols, rows int, startUnix int64) (*castWriter, e
 	return &castWriter{f: f, start: time.Now()}, nil
 }
 
-// write records an output chunk as a timed cast event.
+// write records an output chunk as a timed cast event. While paused, output is
+// dropped from the recording (the live terminal still shows it) — and paused
+// time is excluded from the cast timeline so playback doesn't sit on dead air.
 func (c *castWriter) write(p []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	ev := []any{time.Since(c.start).Seconds(), "o", string(p)}
+	if c.paused {
+		return
+	}
+	elapsed := time.Since(c.start) - c.pausedTotal
+	ev := []any{elapsed.Seconds(), "o", string(p)}
 	b, _ := json.Marshal(ev)
 	c.f.Write(b)
 	c.f.Write([]byte("\n"))
 	c.f.Sync()
+}
+
+// pause stops recording output; resume restores it and excludes the idle gap.
+func (c *castWriter) pause() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.paused {
+		c.paused = true
+		c.pausedAt = time.Now()
+	}
+}
+func (c *castWriter) resume() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.paused {
+		c.paused = false
+		c.pausedTotal += time.Since(c.pausedAt)
+	}
 }
 
 func (c *castWriter) close() { c.f.Close() }
@@ -60,14 +87,24 @@ func (c *castWriter) close() { c.f.Close() }
 // This is the capture that makes the recording OUR artifact: the agent runs in
 // a real terminal (so its interactive TUI/colors render), and every byte it
 // paints to that terminal is teed into the .cast verbatim — the literal session.
-func runInPTY(cmd *exec.Cmd, castPath string) error {
+// idleTimeout is how long with no human keystroke before we PAUSE recording.
+// The session keeps running; we just stop recording dead air, and mark the gap
+// so the verified record shows exactly when the human went idle and returned.
+const idleTimeout = 45 * time.Second
+
+// ptyHooks lets cmdRun record idle/resume boundaries into the signed chain.
+type ptyHooks struct {
+	onIdle   func(idleStart time.Time)              // human went quiet (timeout fired)
+	onResume func(idleStart, resume time.Time)      // human input returned
+}
+
+func runInPTY(cmd *exec.Cmd, castPath string, hooks ptyHooks) error {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		return fmt.Errorf("pty start: %w", err)
 	}
 	defer func() { _ = ptmx.Close() }()
 
-	// size the PTY to the real terminal, and keep it synced on resize.
 	cols, rows := 80, 24
 	if w, h, e := term.GetSize(int(os.Stdin.Fd())); e == nil {
 		cols, rows = w, h
@@ -80,22 +117,79 @@ func runInPTY(cmd *exec.Cmd, castPath string) error {
 	}
 	defer cw.close()
 
-	// put the real terminal in raw mode so keystrokes pass through untouched;
-	// restore on exit.
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err == nil {
 		defer term.Restore(int(os.Stdin.Fd()), oldState)
 	}
 
-	// stdin -> PTY (user typing into the agent)
-	go func() { _, _ = io.Copy(ptmx, os.Stdin) }()
+	// Activity-tracked stdin -> PTY. Every human keystroke resets the idle
+	// timer; if it fires, we pause the cast recorder (stops dead-air padding)
+	// and mark the gap; the next keystroke resumes. Session is never killed.
+	activity := make(chan struct{}, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, rerr := os.Stdin.Read(buf)
+			if n > 0 {
+				select {
+				case activity <- struct{}{}:
+				default:
+				}
+				ptmx.Write(buf[:n])
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}()
+	go watchIdle(activity, cw, hooks)
 
-	// PTY -> (real terminal + cast). A tee: the user sees the live session,
-	// the cast captures the identical bytes.
+	// PTY -> (real terminal + cast). The user always sees the live session;
+	// the cast only records while not paused.
 	teeWriter := castTee{out: os.Stdout, cast: cw}
 	_, _ = io.Copy(teeWriter, ptmx)
 
 	return cmd.Wait()
+}
+
+// watchIdle pauses the recorder after idleTimeout with no human input, and
+// resumes on the next keystroke. Boundaries are reported to the chain via hooks.
+func watchIdle(activity <-chan struct{}, cw *castWriter, hooks ptyHooks) {
+	timer := time.NewTimer(idleTimeout)
+	defer timer.Stop()
+	paused := false
+	var idleStart time.Time
+	for {
+		select {
+		case _, ok := <-activity:
+			if !ok {
+				return
+			}
+			if paused {
+				paused = false
+				cw.resume()
+				if hooks.onResume != nil {
+					hooks.onResume(idleStart, time.Now())
+				}
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(idleTimeout)
+		case <-timer.C:
+			if !paused {
+				paused = true
+				idleStart = time.Now()
+				cw.pause()
+				if hooks.onIdle != nil {
+					hooks.onIdle(idleStart)
+				}
+			}
+		}
+	}
 }
 
 // castTee writes the same bytes to the real terminal and the cast recording.

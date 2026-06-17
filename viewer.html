@@ -188,6 +188,11 @@
   .rbnote-warn b{color:#e6d8b0;}
   #realPane{flex:1;min-height:0;display:flex;flex-direction:column;}
   #castPlayer{flex:1;min-height:0;border:1px solid #2b3038;border-radius:8px;overflow:hidden;}
+  .dlrow{display:flex;align-items:center;gap:10px;margin-top:12px;flex:0 0 auto;}
+  .dlbtn{font:12px/1 var(--mono);color:var(--ink);background:#1f242b;border:1px solid var(--line);border-radius:6px;padding:8px 12px;cursor:pointer;}
+  .dlbtn:hover{border-color:var(--dim);}
+  .dlbtn:disabled{opacity:.5;cursor:default;}
+  .dlnote{color:var(--dim);font:11px/1.4 var(--mono);}
 </style>
 <link rel="stylesheet" href="/asciinema-player.css">
 <script src="/asciinema-player.min.js"></script>
@@ -257,6 +262,11 @@
     <div id="realPane" class="hidden">
       <div class="rbnote rbnote-warn">⚠ Real terminal recording — the actual TTY the operator saw, ANSI and all. This is <b>ground truth you can watch</b>, but it is <b>NOT forgery-proof</b>: the agent rendered it and could have lied to the screen. The chain commits to its hash (swap-proof), and <b>verify</b> cross-checks it against the recording's committed SHA-256. Trust the verified replay; <b>watch</b> this.</div>
       <div id="castPlayer"></div>
+      <div class="dlrow">
+        <button class="dlbtn" id="dlHtml">⤓ Download standalone player (.html)</button>
+        <button class="dlbtn" id="dlVideo">⤓ Record to video (.webm)</button>
+        <span class="dlnote" id="dlNote">offline, opens in any browser · text stays selectable</span>
+      </div>
     </div>
   </div>
 </div>
