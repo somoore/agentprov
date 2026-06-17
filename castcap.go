@@ -19,12 +19,13 @@ import (
 // chain recorder). The header keeps a unix start timestamp so the relative
 // event times can later be aligned to the chain's absolute UTC.
 type castWriter struct {
-	mu         sync.Mutex
-	f          *os.File
-	start      time.Time
-	paused     bool
-	pausedAt   time.Time
+	mu          sync.Mutex
+	f           *os.File
+	start       time.Time
+	paused      bool
+	pausedAt    time.Time
 	pausedTotal time.Duration // total idle time excluded from the timeline
+	pending     []byte        // trailing incomplete UTF-8 bytes carried to next write
 }
 
 func newCastWriter(path string, cols, rows int, startUnix int64) (*castWriter, error) {
@@ -46,10 +47,31 @@ func newCastWriter(path string, cols, rows int, startUnix int64) (*castWriter, e
 // write records an output chunk as a timed cast event. While paused, output is
 // dropped from the recording (the live terminal still shows it) — and paused
 // time is excluded from the cast timeline so playback doesn't sit on dead air.
+//
+// PTY reads land on arbitrary byte boundaries, so a multi-byte UTF-8 char (e.g.
+// Claude's '─' box-drawing, 3 bytes) can straddle two chunks. string() on a
+// chunk that ends mid-char yields broken bytes that json.Marshal rewrites as
+// U+FFFD (�) — visible corruption in the recording. We hold back any trailing
+// incomplete UTF-8 sequence and prepend it to the next chunk so every emitted
+// event is valid UTF-8.
 func (c *castWriter) write(p []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.paused {
+		return
+	}
+	// prepend bytes carried from the previous read that didn't form a full rune.
+	if len(c.pending) > 0 {
+		p = append(c.pending, p...)
+		c.pending = nil
+	}
+	// split off a trailing incomplete UTF-8 sequence to carry to the next write.
+	good := completeUTF8Prefix(p)
+	if good < len(p) {
+		c.pending = append(c.pending[:0:0], p[good:]...)
+		p = p[:good]
+	}
+	if len(p) == 0 {
 		return
 	}
 	elapsed := time.Since(c.start) - c.pausedTotal
@@ -58,6 +80,43 @@ func (c *castWriter) write(p []byte) {
 	c.f.Write(b)
 	c.f.Write([]byte("\n"))
 	c.f.Sync()
+}
+
+// completeUTF8Prefix returns the length of the longest prefix of p that ends on
+// a UTF-8 rune boundary (i.e. excludes a trailing incomplete multi-byte char).
+func completeUTF8Prefix(p []byte) int {
+	if len(p) == 0 {
+		return 0
+	}
+	// scan back up to 3 bytes (max UTF-8 continuation length) for a start byte.
+	for i := len(p) - 1; i >= 0 && i >= len(p)-4; i-- {
+		b := p[i]
+		if b&0x80 == 0 {
+			return len(p) // last byte is ASCII — whole buffer is complete
+		}
+		if b&0xC0 == 0xC0 { // a lead byte: it begins the trailing char
+			want := utf8SeqLen(b)
+			if i+want <= len(p) {
+				return len(p) // the trailing char is complete
+			}
+			return i // incomplete — carry from this lead byte
+		}
+		// else continuation byte (0x80..0xBF): keep scanning back to the lead
+	}
+	return len(p)
+}
+
+func utf8SeqLen(lead byte) int {
+	switch {
+	case lead&0xE0 == 0xC0:
+		return 2
+	case lead&0xF0 == 0xE0:
+		return 3
+	case lead&0xF8 == 0xF0:
+		return 4
+	default:
+		return 1
+	}
 }
 
 // pause stops recording output; resume restores it and excludes the idle gap.
