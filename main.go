@@ -65,6 +65,11 @@ func run(args []string) error {
 			return errors.New("usage: agentprov attach-cast <chain.jsonl> <session.cast>")
 		}
 		return cmdAttachCast(args[1], args[2])
+	case "attach-flows":
+		if len(args) < 3 {
+			return errors.New("usage: agentprov attach-flows <chain.jsonl> <events.jsonl>")
+		}
+		return cmdAttachFlows(args[1], args[2])
 	case "run":
 		return cmdRun(args[1:])
 	case "record":
@@ -273,6 +278,68 @@ func cmdAttachCast(chainPath, castPath string) error {
 	fmt.Printf("attached %s (%d bytes) to %s\n", castName, len(castBytes), chainPath)
 	fmt.Printf("  sha256: %s\n", castHash)
 	fmt.Printf("  the chain now commits to this recording — swap it and verify fails.\n")
+	return nil
+}
+
+// cmdAttachFlows binds an agentsnitch flows file (events.jsonl) to the chain by
+// committing its SHA-256, so a swapped flow file is caught by verify. The flows
+// are a THIRD evidence layer (OS-observed egress + agentsnitch's probabilistic
+// tool links); committing the hash makes the overlay tamper-evident without
+// putting the flows — or agentsnitch's confidence guesses — into the signed chain.
+func cmdAttachFlows(chainPath, flowsPath string) error {
+	nodes, err := loadChain(chainPath)
+	if err != nil {
+		return err
+	}
+	if len(nodes) == 0 {
+		return errors.New("empty chain")
+	}
+	flows, ferr := loadFlows(flowsPath)
+	if ferr != nil {
+		return ferr
+	}
+	flowBytes, err := os.ReadFile(flowsPath)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(flowBytes)
+	flowHash := hex.EncodeToString(sum[:])
+
+	priv, pub, keySource, err := loadOrCreateSigningKey()
+	if err != nil {
+		return err
+	}
+	if err := writePubFile(pub); err != nil {
+		return err
+	}
+	flowName := "flows.jsonl"
+	if err := os.WriteFile(flowName, flowBytes, 0o600); err != nil {
+		return err
+	}
+
+	f, err := os.OpenFile(chainPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	tail := nodes[len(nodes)-1]
+	rec := newRecorder(bufio.NewWriter(f), priv)
+	rec.seq = tail.Seq + 1
+	rec.prev = tail.Hash
+	rec.emit(Node{
+		Op:      "flow_evidence",
+		Summary: "OS-observed network flows (agentsnitch) — overlay evidence, not signed chain content",
+		Attrs: map[string]string{
+			"sha256": flowHash,
+			"file":   flowName,
+			"flows":  fmt.Sprintf("%d", len(flows)),
+			"key":    keySource,
+		},
+	})
+	rec.w.Flush()
+	fmt.Printf("attached %s (%d outbound flows) to %s\n", flowName, len(flows), chainPath)
+	fmt.Printf("  sha256: %s\n", flowHash)
+	fmt.Printf("  the chain now commits to this flow evidence — swap it and verify fails.\n")
 	return nil
 }
 
@@ -851,6 +918,7 @@ func cmdVerify(path string) error {
 	keySource := "unknown"
 	var egress []string
 	var castNode *Node
+	var flowNode *Node
 	for i := range nodes {
 		n := nodes[i]
 		if n.Net != "" {
@@ -886,6 +954,9 @@ func cmdVerify(path string) error {
 		if n.Op == "cast_recording" {
 			castNode = &nodes[i]
 		}
+		if n.Op == "flow_evidence" {
+			flowNode = &nodes[i]
+		}
 		prev = n.Hash
 	}
 
@@ -897,6 +968,7 @@ func cmdVerify(path string) error {
 	}
 	printNetwork(egress)
 	printCast(castNode)
+	printFlows(flowNode)
 	printCoverage()
 	if !cleanExit {
 		fmt.Printf("liveness:   ⚠ GAP DETECTED — no clean-exit heartbeat. The run was truncated or the recorder\n")
@@ -952,6 +1024,35 @@ func printCast(n *Node) {
 	fmt.Printf("recording:  ✓ real terminal recording present and matches the chain (%s)\n", file)
 	fmt.Printf("            note: this is the agent's self-rendered TTY — watchable ground truth, but\n")
 	fmt.Printf("            NOT forgery-proof. The verified replay above is. Cross-check the two.\n")
+}
+
+// printFlows checks an attached agentsnitch flows file against its committed
+// hash. The flows are OS-observed egress (a third evidence layer); committing
+// the hash makes the overlay swap-proof, but the flows — and agentsnitch's
+// probabilistic tool links — stay OUT of the signed chain.
+func printFlows(n *Node) {
+	if n == nil {
+		return
+	}
+	committed := n.Attrs["sha256"]
+	file := n.Attrs["file"]
+	if file == "" {
+		file = "flows.jsonl"
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		fmt.Printf("flows:      ⚠ committed (%s) but %s not found — flow evidence missing\n", short(committed), file)
+		return
+	}
+	sum := sha256.Sum256(data)
+	got := hex.EncodeToString(sum[:])
+	if got != committed {
+		fmt.Printf("flows:      ✗ ALTERED — %s no longer matches the committed hash (swapped after the run)\n", file)
+		return
+	}
+	fmt.Printf("flows:      ✓ OS-observed network flows present and match the chain (%s, %s flows)\n", file, n.Attrs["flows"])
+	fmt.Printf("            note: flows are a FACT (real sockets); the tool<->flow links are agentsnitch's\n")
+	fmt.Printf("            probabilistic correlation (confidence-labeled), not agentprov's verdict.\n")
 }
 
 func printCoverage() {
