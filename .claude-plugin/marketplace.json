@@ -1,0 +1,17 @@
+{
+  "name": "agentprov",
+  "owner": {
+    "name": "Scott Moore"
+  },
+  "metadata": {
+    "description": "Tamper-evident provenance recording for AI coding agents — records a signed, verifiable chain of what the agent did on every Claude Code session, and tells the user the session is monitored.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "agentprov",
+      "source": "./plugin/agentprov",
+      "description": "Provenance chain + monitored banner on every Claude Code session, plus a review skill. Distrust the agent; trust the chain."
+    }
+  ]
+}
