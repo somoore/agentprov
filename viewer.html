@@ -147,6 +147,7 @@
   #termpre .tnet{color:#3fb950;font-weight:700;}        /* network egress */
   #termpre .tsub{color:#d29922;font-weight:700;}        /* MCP / subagent */
   #termpre .tbreak{color:#f85149;font-weight:700;}      /* tamper break */
+  #termpre .tidle{color:#d9a441;font-weight:700;}       /* human idle gap */
   #termpre .tcur{background:#c9d1d9;color:#1a1d23;animation:blink 1.05s steps(1) infinite;}
   @keyframes blink{50%{opacity:0;}}
   /* banner / footer chrome */
@@ -302,7 +303,7 @@ async function analyze(nodes){
 }
 
 // classify which nodes are "the story" vs "plumbing"
-const STORY=new Set(["prompt","tool_call","tool_result","assistant","subagent","image"]);
+const STORY=new Set(["prompt","tool_call","tool_result","assistant","subagent","image","idle_gap","resume"]);
 function isPlumbing(n){ return !STORY.has(n.op) && n.op!=="heartbeat"; }
 
 function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
@@ -441,8 +442,8 @@ function renderTicks(){
   timeline.forEach((x,i)=>{
     let cls;
     if(x.n.seq===brkSeq) cls="brk";                          // tamper break
+    else if(x.n.op==="idle_gap") cls="idle";                 // recorded human-idle pause
     else if(x.n.net) cls="netmark";                          // egress moment
-    else if(i>0 && x.t-timeline[i-1].t>IDLE) cls="idle";     // idle gap before this
     else if(x.n.op==="heartbeat") cls="";                    // recorder clock tick
     else return;                                             // not a marked moment
     const d=document.createElement("div");
@@ -515,6 +516,12 @@ function termLine(x){
   }
   if(n.op==="image")
     return `  <span class="tres">⎿  ${te(n.detail)}</span>`;
+  if(n.op==="idle_gap")
+    return `\n<span class="tidle">⏸ ── human went idle (no input ≥45s) — recording paused ──</span>`;
+  if(n.op==="resume"){
+    const s=n.attrs&&n.attrs.idle_seconds;
+    return `<span class="tidle">▶ ── resumed${s?` after ${s}s idle`:""} ──</span>\n`;
+  }
   if(n.op==="heartbeat")
     return `<span class="tdim">  · recorder · ${te(n.summary)} · ${fmtClock(x.t)}</span>`;
   return "";
@@ -643,6 +650,65 @@ function mountCast(){
 }
 $("#modeVerified").onclick=()=>showMode("verified");
 $("#modeReal").onclick=()=>showMode("real");
+
+function dl(blob,name){
+  const u=URL.createObjectURL(blob), a=document.createElement("a");
+  a.href=u; a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(u),2000);
+}
+
+// Download a SELF-CONTAINED .html: the cast + asciinema-player JS/CSS inlined,
+// cast as a data-URI so it plays offline with no network. Opens in any browser
+// on mac/Windows/Linux; text stays selectable.
+$("#dlHtml").onclick=async()=>{
+  const btn=$("#dlHtml"); btn.disabled=true; btn.textContent="building…";
+  try{
+    const [cast,js,css]=await Promise.all([
+      fetch("/cast").then(r=>r.text()),
+      fetch("/asciinema-player.min.js").then(r=>r.text()),
+      fetch("/asciinema-player.css").then(r=>r.text()),
+    ]);
+    const castURI="data:text/plain;base64,"+btoa(unescape(encodeURIComponent(cast)));
+    const html=`<!doctype html><meta charset="utf-8"><title>agentprov — recorded session</title>
+<style>${css}
+body{margin:0;background:#0d0f12;color:#c9d1d9;font:13px/1.5 ui-monospace,Menlo,monospace}
+.h{padding:12px 16px;border-bottom:1px solid #2b3038}
+.h b{color:#e6edf3} .w{color:#d9a441;font-size:11px;margin-top:4px}
+#p{height:80vh}</style>
+<div class="h"><b>agentprov — real terminal recording</b>
+<div class="w">⚠ Reconstruction of a recorded session. Ground truth you can watch, NOT forgery-proof — verify the chain for integrity.</div></div>
+<div id="p"></div>
+<script>${js}<\/script>
+<script>AsciinemaPlayer.create(${JSON.stringify(castURI)},document.getElementById("p"),{theme:"asciinema",fit:"both",terminalFontSize:"14px"});<\/script>`;
+    dl(new Blob([html],{type:"text/html"}),"agentprov-session.html");
+    btn.textContent="✓ downloaded";
+  }catch(e){ btn.textContent="failed — see console"; console.error(e); }
+  setTimeout(()=>{btn.disabled=false; btn.textContent="⤓ Download standalone player (.html)";},1800);
+};
+
+// Record the player to a real .webm via screen capture (getDisplayMedia ->
+// MediaRecorder). Real video, plays in any browser/QuickTime/VLC. Tradeoffs:
+// prompts for screen-share, captures in REAL TIME, .webm (not literal .mp4),
+// pixels (no selectable text). The .html above is the better artifact; this is
+// for when they need a literal video to embed.
+$("#dlVideo").onclick=async()=>{
+  const btn=$("#dlVideo");
+  if(!navigator.mediaDevices?.getDisplayMedia){ btn.textContent="not supported in this browser"; return; }
+  btn.disabled=true; btn.textContent="pick this tab to record…";
+  try{
+    const stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:30},preferCurrentTab:true});
+    const rec=new MediaRecorder(stream,{mimeType:"video/webm"});
+    const chunks=[];
+    rec.ondataavailable=e=>{ if(e.data.size) chunks.push(e.data); };
+    rec.onstop=()=>{ stream.getTracks().forEach(t=>t.stop()); dl(new Blob(chunks,{type:"video/webm"}),"agentprov-session.webm");
+      btn.disabled=false; btn.textContent="⤓ Record to video (.webm)"; };
+    // restart the recording from 0 and play it through, then stop.
+    if(castPlayer){ castPlayer.seek(0); castPlayer.play(); }
+    rec.start();
+    btn.textContent="● recording (real-time)…";
+    const dur=(castPlayer&&castPlayer.getDuration&&castPlayer.getDuration())||30;
+    setTimeout(()=>{ try{rec.stop();}catch(e){} }, (dur+1.5)*1000);
+  }catch(e){ btn.disabled=false; btn.textContent="⤓ Record to video (.webm)"; console.error(e); }
+};
 
 $("#replayBtn").onclick=enterReplay;
 $("#replayClose").onclick=exitReplay;
