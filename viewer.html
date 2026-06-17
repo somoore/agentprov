@@ -131,7 +131,10 @@
   .term{background:#1a1d23;border:1px solid #2b3038;border-radius:8px;padding:0;margin:0 0 14px;overflow:hidden;}
   #termpre{margin:0;padding:16px 20px;
     font-family:"Menlo","SF Mono",ui-monospace,monospace;font-size:14px;line-height:21px;
-    color:#c9d1d9;white-space:pre-wrap;word-break:break-word;max-height:560px;overflow:auto;}
+    color:#c9d1d9;max-height:560px;overflow:auto;}
+  /* each event is its own <pre> child so appending one reflows only that block,
+     not the whole 1M-char session (the monolithic <pre> was the perf wall). */
+  #termpre .tevent{margin:0;font:inherit;white-space:pre-wrap;word-break:break-word;}
   #termpre .tdim{color:#7d8590;}
   #termpre .tfaint{color:#636c76;}
   #termpre .tcrab{color:#c25a5b;}
@@ -222,7 +225,7 @@
     <div class="rbnote">⚠ Reconstruction, not a recording — replayed from the signed event chain (UTC timestamps, idle-compressed). Not a screen/disk capture. Every line is a hashed event in the forensic list behind this.</div>
     <div class="term" id="term">
       <div class="termchrome" id="tbannerSlot"></div>
-      <pre id="termpre"></pre>
+      <div id="termpre"></div>
       <div class="termchrome" id="tfooterSlot"></div>
     </div>
     <div class="rbrow">
@@ -517,21 +520,21 @@ function bannerHTML(){
 function footerHTML(){
   const cur=timeline[cursor];
   const clk=cur?fmtClock(cur.t):"—";
-  return `<div class="tfooter"><span>${cursor+1}/${timeline.length} events · ${clk}</span>`+
+  return `<div class="tfooter"><span id="tfooterCount">${cursor+1}/${timeline.length} events · ${clk}</span>`+
     `<span class="eff"><span class="dot"></span>verified chain · /agentprov</span></div>`;
 }
 // rendered = index of the last node currently in the DOM. We APPEND on forward
 // play (O(1) per tick) and only fully rebuild when seeking backward — otherwise
 // rebuilding seq 0..cursor every tick on uncapped content freezes the page.
 let rendered=-1;
-function lineHTML(i){
+function eventHTML(i){
   const seg=termLine(timeline[i]);
-  return seg?seg+"\n":"";
+  return seg?`<pre class="tevent" data-i="${i}">${seg}</pre>`:"";
 }
 function fullRebuild(){
   let body="";
-  for(let i=0;i<=cursor && i<timeline.length;i++) body+=lineHTML(i);
-  $("#termpre").innerHTML=body+`<span class="tbreak" id="tbreakmark"></span><span class="tcur"> </span>`;
+  for(let i=0;i<=cursor && i<timeline.length;i++) body+=eventHTML(i);
+  $("#termpre").innerHTML=body+`<pre class="tevent tbreak" id="tbreakmark"></pre><pre class="tevent tcur"> </pre>`;
   rendered=cursor;
 }
 function renderTerminal(){
@@ -539,21 +542,21 @@ function renderTerminal(){
   if(cursor<rendered || rendered<0){
     fullRebuild();
   }else if(cursor>rendered){
-    // append only the newly revealed nodes before the cursor/break markers
+    // append only the newly revealed events (each its own <pre>, so layout is
+    // local — appending doesn't reflow the whole session).
     let add="";
-    for(let i=rendered+1;i<=cursor;i++) add+=lineHTML(i);
-    const cur=pre.querySelector(".tcur"), brk=pre.querySelector("#tbreakmark");
-    cur.insertAdjacentHTML("beforebegin",add);
+    for(let i=rendered+1;i<=cursor;i++) add+=eventHTML(i);
+    pre.querySelector(".tcur").insertAdjacentHTML("beforebegin",add);
     rendered=cursor;
   }
-  // break marker: show only when the cursor is exactly on the break node
   const cur=timeline[cursor];
   const brk=pre.querySelector("#tbreakmark");
   if(brk) brk.innerHTML = (cur && cur.n.seq===(lastRes.fb>=0?allNodes[lastRes.fb]?.seq:null))
-    ? `✗ CHAIN BREAKS HERE — record altered. Nothing below can be trusted.\n` : "";
-  pre.scrollTop=pre.scrollHeight;
-  $("#tbannerSlot").innerHTML=bannerHTML();
-  $("#tfooterSlot").innerHTML=footerHTML();
+    ? `✗ CHAIN BREAKS HERE — record altered. Nothing below can be trusted.` : "";
+  // scroll to bottom only while playing (a layout write, but cheap now that
+  // each event is its own block); skip on scrub so dragging stays smooth.
+  if(playing) pre.scrollTop=pre.scrollHeight;
+  const fc=$("#tfooterCount"); if(fc) fc.textContent=`${cursor+1}/${timeline.length} events · ${cur?fmtClock(cur.t):"—"}`;
 }
 
 function step(){
@@ -573,7 +576,10 @@ function enterReplay(){
   replayOn=true; buildTimeline();
   $("#replayModal").classList.remove("hidden");
   $("#rbscrub").max=Math.max(0,timeline.length-1);
-  cursor=0; rendered=-1; renderTicks(); applyReveal();
+  cursor=0; rendered=-1;
+  $("#tbannerSlot").innerHTML=bannerHTML();   // static — render once
+  $("#tfooterSlot").innerHTML=footerHTML();   // shell once; counts update in place
+  renderTicks(); applyReveal();
 }
 function exitReplay(){
   replayOn=false; pause();
