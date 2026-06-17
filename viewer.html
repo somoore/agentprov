@@ -134,7 +134,7 @@
     color:#c9d1d9;white-space:pre-wrap;word-break:break-word;max-height:560px;overflow:auto;}
   #termpre .tdim{color:#7d8590;}
   #termpre .tfaint{color:#636c76;}
-  #termpre .tcrab{color:#c96f5f;}
+  #termpre .tcrab{color:#c25a5b;}
   #termpre .tname{color:#e6edf3;font-weight:700;}      /* bold tool name / Claude Code */
   #termpre .tuser{color:#adbac7;}                       /* user prompt text */
   #termpre .tagent{color:#c9d1d9;}                      /* assistant text */
@@ -149,7 +149,7 @@
   /* banner / footer chrome */
   .termchrome{background:#1a1d23;font-family:"Menlo","SF Mono",ui-monospace,monospace;font-size:14px;line-height:19px;}
   .tbanner{display:flex;gap:20px;padding:16px 20px 0;}
-  .tbanner .crab{color:#c96f5f;font-size:13px;line-height:13px;white-space:pre;margin:0;}
+  .tbanner .crab{flex:0 0 auto;display:flex;align-items:flex-start;padding-top:2px;}
   .tbanner .bcol{display:flex;flex-direction:column;gap:2px;}
   .tbanner .btitle{color:#e6edf3;font-weight:700;}
   .tbanner .bver,.tbanner .bdim{color:#7d8590;}
@@ -475,14 +475,32 @@ function termLine(x){
     return `<span class="tdim">  · recorder · ${te(n.summary)} · ${fmtClock(x.t)}</span>`;
   return "";
 }
-// The Claude Code welcome crab, as monospace pixel-art (matches the approved mockup).
-const CRAB=["██      ██","  ██████ ","██ ██ ██ ██","██  ████  ██"];
+// The Claude Code welcome crab, traced from a real capture as a pixel bitmap
+// (1 = filled). Rendered as an SVG grid of squares — true pixel art, no
+// font-rendering gaps. '#' filled, '.' empty.
+const CRAB_PIX=[
+  "..######..",
+  ".########.",
+  "##########",
+  "##.####.##",
+  "##.####.##",
+  "##########",
+  ".########.",
+  ".#..##..#.",
+];
+function crabSVG(px){
+  const rows=CRAB_PIX.length, cols=CRAB_PIX[0].length;
+  let rects="";
+  for(let y=0;y<rows;y++) for(let x=0;x<cols;x++)
+    if(CRAB_PIX[y][x]==="#") rects+=`<rect x="${x}" y="${y}" width="1" height="1"/>`;
+  return `<svg width="${cols*px}" height="${rows*px}" viewBox="0 0 ${cols} ${rows}" `+
+    `shape-rendering="crispEdges" fill="#c25a5b" xmlns="http://www.w3.org/2000/svg">${rects}</svg>`;
+}
 function bannerHTML(){
-  const crab=CRAB.map(r=>`<span class="tcrab">${r}</span>`).join("\n");
   // a representative model/cwd line — from chain attrs when present, else generic.
   const cwd=(allNodes.find(n=>n.attrs&&n.attrs.cwd)||{}).attrs?.cwd||"~";
   return `<div class="tbanner">`+
-    `<pre class="crab">${crab}</pre>`+
+    `<div class="crab">${crabSVG(6)}</div>`+
     `<div class="bcol">`+
       `<div><span class="btitle">Claude Code</span> <span class="bver">v2.1.179</span></div>`+
       `<div class="bdim">Opus 4.8 (1M context) · agentprov reconstruction</div>`+
