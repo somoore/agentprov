@@ -79,3 +79,117 @@ forensic record, and the anomaly sensor in one structure.
   show a forged event fails verify" demo.
 - later (demand-pulled): MCP proxy source, behavioral fingerprinting/anomaly, transparency-log
   anchoring, root-tier ES/eBPF backend for the adversarial threat model.
+
+---
+
+## Target architecture (backwards from the enterprise customer)
+
+Designed from Scott's operational experience running Claude Code OTLP -> CrowdStrike for 100+
+clients. The whole design is shaped by four buyer concerns, in priority order: **trust**
+(stays in their boundary), **friction** (no rip-and-replace, low marginal cost), **scale**
+(don't build the ingest dragon), **cost** (cheap by default).
+
+### Data plane (deterministic — the critical path)
+
+```
+claude/codex  ->  user/home IP  ->  native OTLP  ->  WAF  ->  API Gateway  ->  Lambda
+                                                                                  |  (in THEIR VPC)
+                                                                                  |  1. decode protobuf
+                                                                                  |  2. redact (deterministic: pattern-match secrets/PII/PAN — NOT judgment)
+                                                                                  |  3. HASH-CHAIN + SIGN     <- integrity established at ingest, in their boundary
+                                                                                  |  4. FAN OUT (dumb, no judgment, no filtering):
+                                                                                  +--> HEC -> SIEM            (analyst's existing world: Splunk / CrowdStrike / Sentinel)
+                                                                                  +--> customer-owned sink   (S3 default; Security Lake/OCSF optional)
+```
+
+This reuses Scott's existing, proven Lambda (decode + redact + HEC). The ONE new step is
+hash-chain + sign before fan-out. Signing key in the Lambda's KMS/Secrets Manager — unreachable
+by the agent, a stronger anti-tamper posture than the endpoint keychain. Honest boundary: this
+attests "intact from the ingestion point onward" (catches anything in/after the SIEM), not
+"from the endpoint" — the endpoint->Lambda hop is unsigned native OTLP. Endpoint-signing is a
+later premium tier; Lambda-signing is the zero-endpoint-footprint default.
+
+### The sinks (cheap-by-default, sink-agnostic)
+
+The fan-out target is CONFIGURABLE; the product does not bet on one sink. Let the buyer's
+existing cost/data posture choose:
+- **Default: plain S3** — partitioned by session/date, your metadata layout. Cheap, write-heavy/
+  read-thin-friendly (exactly the agent-telemetry workload shape), customer already knows it,
+  near-zero marginal cost. Demo path AND recommended path. Chain fields ride as columns.
+- **Optional: AWS Security Lake (OCSF)** — only for customers who ALREADY run it. Then it's free
+  adoption of infra they pay for + agent data becomes first-class next to CloudTrail/GuardDuty.
+  Do NOT make it load-bearing: Security Lake bills per-GB on ingest whether or not anyone queries
+  (worst case for write-heavy/read-thin), and that's the CUSTOMER's bill — i.e. a sales objection.
+- **Schema without the service:** write OCSF-shaped Parquet to plain S3 to get the queryable-
+  next-to-everything benefit at S3 cost. Tamper-evidence fields (hash/sig/prev_hash) are OCSF
+  extensions either way.
+- Multi-cloud / non-AWS: the plain-sink path generalizes (Azure Blob + Sentinel, etc.);
+  Security Lake does not.
+
+### Why fork-at-Lambda beats tap-after-ingest
+
+Two ways to get the data for analysis: query it back out of the SIEM, or fork a copy at the
+Lambda. **Fork wins** for the scale concern: SIEM query APIs are rate-limited and built for
+alert-triggered investigation, NOT continuous analysis (Splunk REST 50k-row cap; Graph Security
+~45 calls/min/tenant). The protobuf is already decoded in the Lambda, so a second output is
+nearly free, and you control your own sink's scale instead of being throttled. Caveat that makes
+it safe: "us" must be a sink the CUSTOMER owns inside THEIR cloud, never a vendor SaaS endpoint —
+or you lose the "we never touch your data outside your boundary" trust win.
+
+"Read the customer's existing SIEM as your source" is itself a proven, mainstream pattern (the
+entire 2025-26 AI-SOC category: Dropzone, Prophet, Radiant; SIEMs ship purpose-built query APIs
+for it). Fork-at-Lambda is the lower-latency, scale-friendly variant of the same posture.
+
+### Read / analysis plane (probabilistic — OFF the critical path)
+
+```
+customer-owned sink (S3 / Security Lake)
+        |
+  [agentprov analyzer / reader]   <- reads as a GOVERNED SUBSCRIBER (Lake Formation grant, etc.)
+        |  - VERIFY the chain (deterministic — the verdict)
+        |  - surface to the analyst (the human's existing world)
+        |  - AI-as-analyst: LABELED, ASSISTIVE, walled off — summaries & leads for a human,
+        |    NEVER a verdict, NEVER fed back into the record or the SIEM events as fact
+        |  - retrieval index (S3 Vectors / embeddings): "find sessions like this" — assistive
+        |    search only, NOT detection; embed LAZILY (the sliver investigated), not the firehose
+```
+
+### Product surface: click-to-install app in the customer's SIEM/EDR console
+
+Meet the buyer in the console they already use. Researched install surfaces:
+- **Splunk (Splunkbase):** full — bundled dashboards + custom search commands. Scott knows this.
+- **CrowdStrike Foundry (app catalog):** full + STRONGEST FIT — native dashboards + serverless
+  Functions (Python, can call external APIs / run chain verification in-platform). Scott's Lambda
+  already feeds CrowdStrike, so the whole loop can live in their boundary on their compute.
+- **Microsoft Sentinel (Content Hub / Solutions):** qualified — workbooks + KQL/Logic-Apps, not
+  arbitrary code.
+- **SentinelOne:** outlier — no click-to-install third-party dashboard app (manual GitHub import).
+- Tradeoff: the tap+display layer FORKS per SIEM (real cost); the recorder + chaining stay shared
+  in the Lambda. Most AI-SOC vendors chose one-analyzer/many-thin-connectors to avoid this.
+  Start with ONE SIEM (CrowdStrike Foundry or Splunk — whichever has the warmer path).
+  The browser `viewer.html` already built is the seed of the in-console dashboard.
+
+### The load-bearing rules (the discipline that keeps it a security product, not a guesser)
+
+1. **Deterministic in the path; probabilistic off the path.** The ingest Lambda is DUMB:
+   decode, redact, sign, fork. It never classifies, filters, scores, or judges — a classifier in
+   the ingest path is IFC relocated to the worst possible spot (it silently decides completeness,
+   breaking the one guarantee). All judgment happens after the fork, labeled as analysis.
+2. **Customer-owned sinks only.** Every destination is in the customer's boundary. No vendor SaaS
+   in the data path. This is the trust spine.
+3. **AI/embeddings assist, never verdict.** AI summarizes and retrieves over the proven record for
+   a human; vector similarity FINDS, it does not JUDGE. The verdict is always the deterministic
+   chain. (The reason IFC was removed — do not reintroduce it through the analysis or vector layer.)
+4. **Cheap by default, sink-agnostic.** S3 + lazy embedding over Security Lake + eager normalize.
+   Match cost to actual use; the write-heavy/read-thin workload demands it.
+5. **Differentiation is vertical depth + integrity, not "AI SOC analyst" (saturated).** Generalist
+   AI-SOC tools read everything shallowly; agentprov reads AGENT telemetry deeply with a tamper-
+   evidence guarantee none of them offer. Depth in a vertical + the integrity chain is the wedge.
+
+### Status of this architecture
+
+Design only — NOT built. The shipped artifact today is the local recorder + viewer (deterministic
+spine, proven). This section captures the backwards-from-customer target so it survives context.
+Build nothing here until a real customer pulls it; the hardest piece (the ingest Lambda) is
+already operationally proven by Scott's prior work (knowledge owned; that client's code stays
+theirs — clean-room rebuild).
