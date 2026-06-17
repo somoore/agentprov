@@ -83,8 +83,24 @@ func renderVideo(castPath, format string) (outPath, contentType string, err erro
 	dir := filepath.Dir(castPath)
 	base := strings.TrimSuffix(filepath.Base(castPath), filepath.Ext(castPath))
 	gifPath := filepath.Join(dir, base+".gif")
-	if out, e := exec.Command(agg, castPath, gifPath).CombinedOutput(); e != nil {
-		return "", "", fmt.Errorf("agg failed: %v\n%s", e, out)
+	// Tuned for TUI fidelity: a high FPS cap so the agent's in-place repaints
+	// (spinners, token counters) land on settled frames rather than mid-paint,
+	// a real terminal monospace font with proper box-drawing glyphs, and a
+	// short idle cap so we don't dwell on dead frames. Residual smearing on a
+	// line that's repainting at the captured instant is inherent to flattening
+	// a TUI to video — these flags minimize it.
+	aggArgs := []string{
+		"--fps-cap", "30",
+		"--idle-time-limit", "2",
+		"--font-family", aggFont(),
+		"--font-size", "16",
+		castPath, gifPath,
+	}
+	if out, e := exec.Command(agg, aggArgs...).CombinedOutput(); e != nil {
+		// retry without the font flag in case the chosen font isn't present.
+		if out2, e2 := exec.Command(agg, "--fps-cap", "30", "--idle-time-limit", "2", castPath, gifPath).CombinedOutput(); e2 != nil {
+			return "", "", fmt.Errorf("agg failed: %v\n%s\n%s", e, out, out2)
+		}
 	}
 	if format == "gif" {
 		return gifPath, "image/gif", nil
@@ -101,6 +117,20 @@ func renderVideo(castPath, format string) (outPath, contentType string, err erro
 		return gifPath, "image/gif", nil // mp4 step failed; gif still good
 	}
 	return mp4Path, "video/mp4", nil
+}
+
+// aggFont picks a monospace font with good box-drawing glyphs that's likely
+// installed, per OS. agg falls back internally if it's missing; we also retry
+// without the flag on failure.
+func aggFont() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "Menlo"
+	case "windows":
+		return "Consolas"
+	default:
+		return "DejaVu Sans Mono"
+	}
 }
 
 // cmdVideo is the CLI entry; the viewer uses renderVideo directly via /video.
