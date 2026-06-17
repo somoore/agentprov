@@ -27,10 +27,10 @@ var viewerHTML []byte
 //go:embed sample.jsonl
 var sampleTranscript []byte
 
-//go:embed vendor/asciinema-player.min.js
+//go:embed web/asciinema-player.min.js
 var asciinemaJS []byte
 
-//go:embed vendor/asciinema-player.css
+//go:embed web/asciinema-player.css
 var asciinemaCSS []byte
 
 // cmdDemo is the zero-install proof: write the bundled sample transcript, record

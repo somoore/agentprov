@@ -37,13 +37,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -282,12 +280,14 @@ func cmdRun(args []string) error {
 		return err
 	}
 
-	// Watch the agent's transcript dir; the file it creates after launch is ours.
-	watchDir, ok := transcriptDirFor(args[0])
-	if !ok {
-		return fmt.Errorf("don't know the transcript location for %q (supported: claude, codex)", args[0])
+	// Watch the agent's transcript dir if we know it; the file it creates after
+	// launch is ours. If we don't recognize the agent, we still capture the
+	// terminal recording — the .cast doesn't depend on a transcript.
+	watchDir, knowsTranscript := transcriptDirFor(args[0])
+	var before map[string]bool
+	if knowsTranscript {
+		before = snapshotJSONL(watchDir)
 	}
-	before := snapshotJSONL(watchDir)
 
 	out, err := os.Create("chain.jsonl")
 	if err != nil {
@@ -297,47 +297,64 @@ func cmdRun(args []string) error {
 	rec := newRecorder(bufio.NewWriter(out), priv)
 	rec.emit(Node{Op: "heartbeat", Summary: "recorder start", Attrs: map[string]string{"key": keySource, "agent": args[0]}})
 
-	fmt.Printf("agentprov: recording live (%s key). launching: %s\n\n", keySource, strings.Join(args, " "))
+	const castPath = "session.cast"
+	fmt.Printf("agentprov: recording live (%s key) + terminal -> %s. launching: %s\n\n",
+		keySource, castPath, strings.Join(args, " "))
 	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("launch failed: %w", err)
-	}
 
-	// Forward Ctrl-C to the child but keep recording through it.
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		for s := range sigc {
-			_ = cmd.Process.Signal(s)
-		}
-	}()
-
-	// Find the transcript the run created (poll briefly), then tail it live.
-	transcript := awaitNewTranscript(watchDir, before, 10*time.Second)
+	// Tail the transcript in the background while the agent runs in the PTY
+	// (only when we recognize the agent; the cast capture is independent).
 	done := make(chan struct{})
 	agentEvents := 0
-	if transcript != "" {
-		go tailInto(transcript, rec, &agentEvents, done)
+	if knowsTranscript {
+		transcript := awaitNewTranscriptAsync(watchDir, before)
+		go func() {
+			t := <-transcript
+			if t != "" {
+				tailInto(t, rec, &agentEvents, done)
+			} else {
+				close(done)
+			}
+		}()
 	} else {
-		fmt.Fprintln(os.Stderr, "agentprov: warning — no new transcript appeared; recording exit only")
 		close(done)
 	}
 
-	waitErr := cmd.Wait()
+	// Run the agent in a PTY so the interactive session renders normally AND
+	// every byte it paints is teed into the .cast — our own real recording.
+	waitErr := runInPTY(cmd, castPath)
+
 	time.Sleep(300 * time.Millisecond) // let the tail drain final lines
-	close(done)
-	signal.Stop(sigc)
+	select {
+	case <-done:
+	default:
+		close(done)
+	}
 
 	exitNote := "clean exit"
 	if waitErr != nil {
 		exitNote = "agent exited with error: " + waitErr.Error()
 	}
 	rec.emit(Node{Op: "heartbeat", Summary: "recorder end (" + exitNote + ")"})
+
+	// Commit the real recording into the chain (tamper-evident, not -proof).
+	if castBytes, e := os.ReadFile(castPath); e == nil && len(castBytes) > 0 {
+		sum := sha256.Sum256(castBytes)
+		rec.emit(Node{
+			Op:      "cast_recording",
+			Summary: "real terminal recording (asciinema) — reconstruction's untrusted sibling",
+			Attrs: map[string]string{
+				"sha256": hex.EncodeToString(sum[:]),
+				"file":   castPath,
+				"bytes":  fmt.Sprintf("%d", len(castBytes)),
+				"key":    keySource,
+			},
+		})
+	}
 	rec.w.Flush()
 
-	fmt.Printf("\nagentprov: recorded %d nodes (%d agent events) -> chain.jsonl\n", rec.seq, agentEvents)
-	fmt.Printf("verify with: agentprov verify chain.jsonl\n")
+	fmt.Printf("\nagentprov: recorded %d nodes (%d agent events) -> chain.jsonl + %s\n", rec.seq, agentEvents, castPath)
+	fmt.Printf("watch + verify with: agentprov view chain.jsonl   /   agentprov verify chain.jsonl\n")
 	return nil
 }
 
@@ -365,6 +382,14 @@ func snapshotJSONL(dir string) map[string]bool {
 }
 
 // awaitNewTranscript polls for a .jsonl that appeared after `before`.
+// awaitNewTranscriptAsync polls for the new transcript off the main goroutine,
+// so the PTY session can start immediately. Result arrives on the channel.
+func awaitNewTranscriptAsync(dir string, before map[string]bool) <-chan string {
+	ch := make(chan string, 1)
+	go func() { ch <- awaitNewTranscript(dir, before, 10*time.Second) }()
+	return ch
+}
+
 func awaitNewTranscript(dir string, before map[string]bool, timeout time.Duration) string {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
