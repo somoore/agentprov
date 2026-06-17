@@ -86,6 +86,8 @@ func run(args []string) error {
 		return cmdRecord(args[1])
 	case "sessions":
 		return cmdSessions()
+	case "hook-record": // invoked by the Claude Code SessionEnd hook (reads JSON on stdin)
+		return cmdHookRecord()
 	case "verify":
 		path := chainArgOrLatest(args[1:])
 		if path == "" {
@@ -847,7 +849,12 @@ func subagentID(path string) string {
 
 // ── record a past transcript ───────────────────────────────────────────────
 
-func cmdRecord(path string) error {
+func cmdRecord(path string) error { return recordTranscriptTo(path, ".", false) }
+
+// recordTranscriptTo records a past transcript (Claude/Codex) into a chain at
+// outDir/chain.jsonl, folding in subagents. quiet suppresses output. Used by the
+// CLI 'record' and the SessionEnd hook (which hands us the exact transcript path).
+func recordTranscriptTo(path, outDir string, quiet bool) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -857,10 +864,9 @@ func cmdRecord(path string) error {
 	if err != nil {
 		return err
 	}
-	if err := writePubFile(pub); err != nil {
-		return err
-	}
-	out, err := os.Create("chain.jsonl")
+	_ = writePubFileAt(pub, filepath.Join(outDir, "chain.pub"))
+	chainPath := filepath.Join(outDir, "chain.jsonl")
+	out, err := os.Create(chainPath)
 	if err != nil {
 		return err
 	}
@@ -889,12 +895,50 @@ func cmdRecord(path string) error {
 
 	rec.emit(Node{Op: "heartbeat", Summary: "recorder end (clean exit)"})
 	rec.w.Flush()
-	subNote := ""
-	if len(subs) > 0 {
-		subNote = fmt.Sprintf(", %d subagent(s)", len(subs))
+	if !quiet {
+		subNote := ""
+		if len(subs) > 0 {
+			subNote = fmt.Sprintf(", %d subagent(s)", len(subs))
+		}
+		fmt.Printf("recorded %d nodes (%d agent events%s) -> %s (%s key)\nhead: %s\n",
+			rec.seq, count, subNote, chainPath, keySource, short(rec.prev))
 	}
-	fmt.Printf("recorded %d nodes (%d agent events%s) -> chain.jsonl (%s key)\nhead: %s\n",
-		rec.seq, count, subNote, keySource, short(rec.prev))
+	return nil
+}
+
+// cmdHookRecord is invoked by the Claude Code SessionEnd hook. It reads the
+// hook's JSON from stdin — which gives us the EXACT transcript_path and
+// session_id, so there's zero transcript guessing — and records the signed
+// verified chain into ~/.agentprov/sessions/<session_id>/. This is the plugin
+// path: provenance on every session, no shim, no PTY. (The terminal .cast
+// recording still needs the shim — hooks run inside Claude, can't parent it.)
+func cmdHookRecord() error {
+	var in struct {
+		TranscriptPath string `json:"transcript_path"`
+		SessionID      string `json:"session_id"`
+		HookEvent      string `json:"hook_event_name"`
+	}
+	dec := json.NewDecoder(os.Stdin)
+	if err := dec.Decode(&in); err != nil {
+		return fmt.Errorf("hook input parse: %w", err)
+	}
+	if in.TranscriptPath == "" {
+		return nil // nothing to record (e.g. SessionStart) — succeed silently
+	}
+	id := in.SessionID
+	if id == "" {
+		id = fmt.Sprintf("hook-%d", time.Now().UnixNano()%1000000)
+	}
+	dir := filepath.Join(sessionsRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	// Record quietly; the hook must not pollute the user's terminal.
+	if err := recordTranscriptTo(in.TranscriptPath, dir, true); err != nil {
+		// fail-open: never break the user's session-end because of recording.
+		fmt.Fprintf(os.Stderr, "agentprov: hook record skipped: %v\n", err)
+		return nil
+	}
 	return nil
 }
 

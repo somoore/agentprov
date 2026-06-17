@@ -16,3 +16,4 @@ flows.jsonl
 *.mp4
 agentprov-sample.jsonl
 agentprov-session.*
+plugin/agentprov/bin/agentprov
