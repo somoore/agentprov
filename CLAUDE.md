@@ -42,17 +42,6 @@ Any change here must preserve all three — they ARE the product:
   spots honestly (off-transcript subprocess egress needs the privileged ES/eBPF tier).
 - `cmdMutate` (`tamper`/`drop`) — the demo harness that proves verify fails on a forged/dropped
   node. This is how the README demo and any test must exercise integrity.
-- `cmdAnalyze` — information-flow taint over the chain. Propagates session taint across three
-  legs (untrusted input → sensitive read → exfil sink) and flags lethal-trifecta assembly
-  **in causal order** (a sink before the sensitive read is NOT a trifecta — keep this ordering
-  check; it's what makes this real IFC, not keyword co-occurrence). This is a clean-room
-  re-implementation of the IFC *model* from [`sir`](https://github.com/somoore/sir) — the model
-  only (session taint), never its hooks/oracle/enforcement. `analyze` detects; it never blocks.
-  `normalize` stashes a bounded `detail` attr (command/path/payload text) that the taint pass
-  pattern-matches on. `sensitiveHints` are specific credential ARTIFACTS, not loose words —
-  "token" alone matched "max_output_tokens" on a benign run (a real false positive). When
-  tuning, prefer specificity; this flags for human review, so a miss costs more than an FP, but
-  a noisy FP rate kills trust in the verdict.
 
 ## Commands
 

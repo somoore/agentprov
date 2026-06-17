@@ -68,11 +68,6 @@ func run(args []string) error {
 			return errors.New("usage: agentprov verify <chain.jsonl>")
 		}
 		return cmdVerify(args[1])
-	case "analyze":
-		if len(args) < 2 {
-			return errors.New("usage: agentprov analyze <chain.jsonl>")
-		}
-		return cmdAnalyze(args[1])
 	case "tamper":
 		return cmdMutate(args[1], args[2], false)
 	case "drop":
@@ -432,13 +427,10 @@ func normalize(raw map[string]any) []Node {
 				n.Op, n.Trust = "tool_call", "trusted"
 				n.Tool, _ = b["name"].(string)
 				n.Summary = "tool_use " + n.Tool
-				// detail = the command/path/url the tool acts on; the taint pass reads it.
-				n.Attrs = detailAttr(flatten(b["input"]))
 				nodes = append(nodes, n)
 			case "tool_result":
 				n := base
 				n.Op, n.Trust, n.Summary = "tool_result", "untrusted", "tool_result"
-				n.Attrs = detailAttr(flatten(b["content"]))
 				nodes = append(nodes, n)
 			}
 		}
@@ -476,202 +468,15 @@ func normalize(raw map[string]any) []Node {
 			n.Op, n.Trust = "tool_call", "trusted"
 			n.Tool, _ = payload["name"].(string)
 			n.Summary = "tool_call " + n.Tool
-			n.Attrs = detailAttr(flatten(payload["arguments"]) + " " + flatten(payload["input"]))
 		case "function_call_output", "custom_tool_call_output", "patch_apply_end":
 			// tool RESULTS are where untrusted content (file/web/MCP) enters.
 			n.Op, n.Trust, n.Summary = "tool_result", "untrusted", "tool_result"
-			n.Attrs = detailAttr(flatten(payload["output"]) + " " + flatten(payload["input"]))
 		case "agent_message":
 			n.Op, n.Trust, n.Summary = "assistant", "trusted", "assistant message"
 		}
 		return []Node{n}
 	}
 	return nil
-}
-
-// flatten reduces an arbitrary transcript value (string / map / list) to a single
-// lowercased string the taint pass can pattern-match. Bounded so the chain stays small.
-func flatten(v any) string {
-	var b strings.Builder
-	var walk func(any)
-	walk = func(x any) {
-		if b.Len() > 600 {
-			return
-		}
-		switch t := x.(type) {
-		case string:
-			b.WriteString(t)
-			b.WriteByte(' ')
-		case map[string]any:
-			for _, k := range sortedAnyKeys(t) {
-				walk(t[k])
-			}
-		case []any:
-			for _, e := range t {
-				walk(e)
-			}
-		}
-	}
-	walk(v)
-	// Rune-safe truncate: a byte-slice cut can split a multi-byte UTF-8 rune, which
-	// json.Marshal then re-encodes as U+FFFD — making the stored JSON differ from
-	// what was hashed and breaking verify. Always cut on rune boundaries.
-	return truncRunes(strings.ToLower(strings.TrimSpace(b.String())), 400)
-}
-
-// truncRunes returns at most n runes of s, never splitting a multi-byte rune.
-func truncRunes(s string, n int) string {
-	if len(s) <= n { // fast path: byte len <= n implies rune count <= n
-		return s
-	}
-	r := []rune(s)
-	if len(r) > n {
-		r = r[:n]
-	}
-	return string(r)
-}
-
-func detailAttr(s string) map[string]string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil
-	}
-	return map[string]string{"detail": s}
-}
-
-func sortedAnyKeys(m map[string]any) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	for i := 1; i < len(ks); i++ {
-		for j := i; j > 0 && ks[j-1] > ks[j]; j-- {
-			ks[j-1], ks[j] = ks[j], ks[j-1]
-		}
-	}
-	return ks
-}
-
-// ── analyze: information-flow taint over the chain ──────────────────────────
-//
-// A clean-room re-implementation of the IFC model from `sir` (somoore/sir): the
-// MODEL, not its code — session-level taint propagation, detection only, no
-// enforcement, no hooks, no oracle. It walks the recorded chain and propagates a
-// session taint state across three lethal-trifecta legs:
-//
-//   1. UNTRUSTED INPUT  — an untrusted source entered the session (tool_result,
-//      prompt) carrying potential injection content.
-//   2. SENSITIVE READ   — the session touched secret-bearing material (.env, creds,
-//      keys, tokens) via a tool call/result detail.
-//   3. EXFIL SINK       — an egress-capable action appeared (curl/POST/push/socket).
-//
-// When a single session has assembled all three, that's the lethal trifecta
-// (Willison) / a Rule-of-Two violation (Meta): flagged with the seq that closed it.
-// This is detection over the durable record — the analytic layer the raw flight
-// recorder lacks. It never blocks anything.
-
-type taintState struct {
-	untrustedAt int // seq where untrusted input entered (-1 = not yet)
-	sensitiveAt int
-	exfilAt     int
-}
-
-// signal keyword sets. Deliberately conservative: this is a detector that flags
-// for human review, not an enforcer, so false positives are cheap and misses are
-// the cost. Tune against real runs, not in the abstract.
-var (
-	// Sensitive hints are intentionally specific filenames/paths/phrases, not loose
-	// substrings — "token" alone matches "max_output_tokens" (a real false positive
-	// caught on a benign run). Match credential ARTIFACTS, not the word.
-	sensitiveHints = []string{
-		".env", "credentials", "id_rsa", ".ssh/", ".aws/", "aws_secret_access_key",
-		"private_key", "/etc/shadow", ".npmrc", ".netrc", "secret_key",
-		"api_key=", "apikey=", "authorization: bearer", "-----begin",
-	}
-	exfilHints = []string{
-		"curl ", "wget ", "http://", "https://", "nc ", "ncat", "/dev/tcp",
-		" post ", "fetch(", "urllib", "requests.post", "requests.get",
-		"git push", "scp ", "rsync ", "base64", "| sh", "webhook",
-	}
-)
-
-func cmdAnalyze(path string) error {
-	nodes, err := loadChain(path)
-	if err != nil {
-		return err
-	}
-	st := taintState{untrustedAt: -1, sensitiveAt: -1, exfilAt: -1}
-	var findings []string
-	tripped := false
-
-	for _, n := range nodes {
-		detail := n.Summary + " " + n.Attrs["detail"] + " " + n.Tool
-
-		// Leg 1: untrusted input entered the session.
-		if st.untrustedAt < 0 && n.Trust == "untrusted" && (n.Op == "tool_result" || n.Op == "prompt") {
-			st.untrustedAt = n.Seq
-		}
-		// Leg 2: the session touched sensitive material.
-		if st.sensitiveAt < 0 && matchesAny(detail, sensitiveHints) {
-			st.sensitiveAt = n.Seq
-			findings = append(findings, fmt.Sprintf("seq %d: SENSITIVE access — %s", n.Seq, clip(detail)))
-		}
-		// Leg 3: an egress-capable sink appeared.
-		if matchesAny(detail, exfilHints) && n.Op == "tool_call" {
-			st.exfilAt = n.Seq
-			// Trifecta closes only if both prior legs are present AND ordered
-			// before this sink — the dangerous causal sequence, not mere co-occurrence.
-			if st.untrustedAt >= 0 && st.sensitiveAt >= 0 &&
-				st.untrustedAt <= n.Seq && st.sensitiveAt <= n.Seq {
-				tripped = true
-				findings = append(findings, fmt.Sprintf(
-					"seq %d: ⚠ LETHAL TRIFECTA ASSEMBLED — egress sink (%s) after untrusted input (seq %d) and sensitive read (seq %d)",
-					n.Seq, clip(detail), st.untrustedAt, st.sensitiveAt))
-			} else {
-				findings = append(findings, fmt.Sprintf("seq %d: egress sink — %s", n.Seq, clip(detail)))
-			}
-		}
-	}
-
-	fmt.Printf("analyze: %d nodes. taint legs — untrusted@%s sensitive@%s exfil@%s\n",
-		len(nodes), seqStr(st.untrustedAt), seqStr(st.sensitiveAt), seqStr(st.exfilAt))
-	for _, f := range findings {
-		fmt.Println("  " + f)
-	}
-	if tripped {
-		fmt.Println("VERDICT: ⚠ lethal trifecta detected — this session assembled untrusted-input + sensitive-data + exfil-path. Review before trusting its output.")
-		return errors.New("lethal trifecta detected")
-	}
-	if len(findings) == 0 {
-		fmt.Println("VERDICT: clean — no sensitive-then-exfil flow observed.")
-	} else {
-		fmt.Println("VERDICT: no full trifecta, but flagged flows above warrant a look.")
-	}
-	return nil
-}
-
-func matchesAny(haystack string, needles []string) bool {
-	for _, n := range needles {
-		if strings.Contains(haystack, n) {
-			return true
-		}
-	}
-	return false
-}
-
-func clip(s string) string {
-	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
-	if t := truncRunes(s, 90); t != s {
-		return t + "…"
-	}
-	return s
-}
-
-func seqStr(i int) string {
-	if i < 0 {
-		return "—"
-	}
-	return strconv.Itoa(i)
 }
 
 // ── verify ─────────────────────────────────────────────────────────────────
