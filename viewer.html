@@ -106,6 +106,26 @@
   .broken .why{color:var(--bad);font:11px/1.4 var(--mono);margin-top:4px;}
   .gapbar{margin:8px 0 0 26px;padding:11px 14px;border-radius:9px;border:1px dashed var(--bad);
     color:var(--bad);font:12px/1.4 var(--mono);background:#160f10;}
+
+  /* replay */
+  .replaybar{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:0 0 14px;}
+  .rbnote{color:var(--dim);font:11px/1.5 var(--mono);margin-bottom:10px;border-left:2px solid #d9a441;padding-left:8px;}
+  .rbrow{display:flex;align-items:center;gap:12px;}
+  .rbplay{background:var(--trusted);color:#06140c;border:0;border-radius:6px;width:34px;height:34px;font-size:14px;cursor:pointer;flex:0 0 auto;}
+  .rbtrack{position:relative;flex:1;height:34px;display:flex;align-items:center;}
+  .rbtrack input[type=range]{position:absolute;width:100%;margin:0;appearance:none;background:transparent;height:34px;cursor:pointer;z-index:3;}
+  .rbtrack input[type=range]::-webkit-slider-thumb{appearance:none;width:4px;height:24px;background:#fff;border-radius:2px;box-shadow:0 0 6px rgba(255,255,255,.6);}
+  .rbfill{position:absolute;left:0;top:14px;height:6px;background:rgba(120,160,255,.5);border-radius:3px;z-index:1;}
+  .rbtrack::before{content:"";position:absolute;left:0;right:0;top:14px;height:6px;background:rgba(255,255,255,.07);border-radius:3px;}
+  .rbticks{position:absolute;left:0;right:0;top:8px;height:18px;z-index:2;pointer-events:none;}
+  .rbtick{position:absolute;top:0;width:1.5px;height:10px;background:rgba(120,230,170,.7);}
+  .rbtick.idle{height:18px;width:2px;background:#d9a441;}
+  .rbtick.netmark{height:18px;width:2px;background:#50dc8c;}
+  .rbtick.brk{height:18px;width:3px;background:var(--bad);}
+  .rbclock{color:var(--ink);font:12px/1 var(--mono);flex:0 0 auto;min-width:128px;text-align:right;}
+  .rbnow{color:var(--dim);font:12px/1.4 var(--mono);margin-top:10px;min-height:1.4em;}
+  .rbnow b{color:var(--ink);}
+  .node.future{display:none;}
 </style>
 </head>
 <body>
@@ -133,9 +153,21 @@
 
     <div class="secthead">
       <span>What the agent did</span><div class="ln"></div>
+      <span class="toggle" id="replayBtn">▶ replay session</span>
       <span class="toggle" id="expand">collapse all</span>
       <span class="toggle" id="toggle">show plumbing</span>
     </div>
+
+    <div class="replaybar hidden" id="replaybar">
+      <div class="rbnote">⚠ Reconstruction, not a recording — replayed from the signed event chain (UTC timestamps, idle-compressed). Not a screen capture or disk image. Doubt a moment? It's a real hashed event in the list below.</div>
+      <div class="rbrow">
+        <button class="rbplay" id="rbplay">▶</button>
+        <div class="rbtrack" id="rbtrack"><div class="rbfill" id="rbfill"></div><div class="rbticks" id="rbticks"></div><input type="range" id="rbscrub" min="0" value="0" step="1"></div>
+        <span class="rbclock" id="rbclock">—</span>
+      </div>
+      <div class="rbnow" id="rbnow"></div>
+    </div>
+
     <div class="chain" id="chain"></div>
   </div>
 </div>
@@ -262,9 +294,11 @@ function drawChain(){
     const n=allNodes[i];
     if(isPlumbing(n)&&!showPlumbing) continue;
     const el=nodeEl(n,i,i===lastRes.fb,lastRes.why);
+    el.dataset.seq=n.seq;
     if(el.querySelector(".detail")){ if(expandAll)el.classList.add("open"); el.addEventListener("click",()=>el.classList.toggle("open")); }
     chain.appendChild(el);
   }
+  if(replayOn) applyReveal();
   if(!lastRes.clean&&lastRes.fb<0){
     const g=document.createElement("div");g.className="gapbar";
     g.textContent="⚠ recorder went dark here — no clean-exit heartbeat. The silence is the signal.";
@@ -274,6 +308,106 @@ function drawChain(){
 
 $("#toggle").onclick=()=>{showPlumbing=!showPlumbing;$("#toggle").textContent=showPlumbing?"hide plumbing":"show plumbing";drawChain();};
 $("#expand").onclick=()=>{expandAll=!expandAll;$("#expand").textContent=expandAll?"collapse all":"expand all";drawChain();};
+
+// ── replay ─────────────────────────────────────────────────────────────────
+// Reveal nodes in real TIME order (so subagents interleave as they actually
+// ran), pacing by real gaps but CAPPING idle so a 12-min lunch isn't 12 min of
+// dead air. Heartbeats / network egress / the break point are drawn as ticks on
+// the scrub track. Everything is rendered from the verified chain — a
+// reconstruction, never a capture.
+let replayOn=false, timeline=[], cursor=0, playing=false, timer=null, seqTime={};
+const MAXGAP=2200, IDLE=15000; // ms: cap inter-event delay; gaps >15s real = "idle"
+
+function tms(t){ const v=Date.parse(t); return isNaN(v)?null:v; }
+
+function buildTimeline(){
+  // story+heartbeat nodes that carry a timestamp, sorted by real UTC time.
+  timeline=allNodes.filter(n=>n.time&&(STORY.has(n.op)||n.op==="heartbeat"))
+    .map(n=>({n,t:tms(n.time)})).filter(x=>x.t!=null)
+    .sort((a,b)=>a.t-b.t);
+  seqTime={}; for(const n of allNodes) if(n.time) seqTime[n.seq]=tms(n.time);
+}
+
+function fmtClock(ms){ if(ms==null)return "—"; const d=new Date(ms);
+  return d.toISOString().slice(11,19)+"Z"; }
+function fmtDur(ms){ const s=Math.round(ms/1000); if(s<90)return s+"s";
+  const m=Math.round(s/60); if(m<90)return m+"m"; return Math.round(m/60)+"h"; }
+
+function renderTicks(){
+  const wrap=$("#rbticks"); wrap.innerHTML="";
+  if(!timeline.length)return;
+  const n=timeline.length-1||1;
+  const brkSeq=lastRes.fb>=0?allNodes[lastRes.fb]?.seq:null;
+  timeline.forEach((x,i)=>{
+    let cls;
+    if(x.n.seq===brkSeq) cls="brk";                          // tamper break
+    else if(x.n.net) cls="netmark";                          // egress moment
+    else if(i>0 && x.t-timeline[i-1].t>IDLE) cls="idle";     // idle gap before this
+    else if(x.n.op==="heartbeat") cls="";                    // recorder clock tick
+    else return;                                             // not a marked moment
+    const d=document.createElement("div");
+    d.className="rbtick"+(cls?" "+cls:"");
+    d.style.left=(i/n*100)+"%";
+    wrap.appendChild(d);
+  });
+}
+
+function applyReveal(){
+  if(!timeline.length)return;
+  const upto=timeline[cursor]?.t ?? Infinity;
+  // hide any chain node whose time is after the cursor's time
+  document.querySelectorAll("#chain .node").forEach(el=>{
+    const t=seqTime[+el.dataset.seq];
+    el.classList.toggle("future", t!=null && t>upto);
+  });
+  // fill + clock + "now playing" line
+  const n=timeline.length-1||1;
+  $("#rbfill").style.width=(cursor/n*100)+"%";
+  $("#rbscrub").value=cursor;
+  const cur=timeline[cursor];
+  $("#rbclock").textContent=fmtClock(cur?.t)+"  "+(cursor+1)+"/"+timeline.length;
+  if(cur){
+    const who=cur.n.op==="prompt"?"🧑 human":cur.n.op==="assistant"?"🤖 agent":
+      cur.n.op==="heartbeat"?"⏱ recorder":cur.n.op==="subagent"?"↳ subagent":
+      cur.n.tool?("🔧 "+cur.n.tool):cur.n.op;
+    const txt=(cur.n.detail||cur.n.net||cur.n.summary||"").slice(0,140);
+    $("#rbnow").innerHTML=`<b>${esc(who)}</b> — ${esc(txt)}`;
+    // scroll the live node into view
+    const liveEl=document.querySelector(`#chain .node[data-seq="${cur.n.seq}"]`);
+    if(liveEl&&playing) liveEl.scrollIntoView({block:"center",behavior:"smooth"});
+  }
+}
+
+function step(){
+  if(cursor>=timeline.length-1){ pause(); return; }
+  const gap=timeline[cursor+1].t-timeline[cursor].t;
+  cursor++;
+  applyReveal();
+  const delay=Math.min(Math.max(gap,120),MAXGAP); // floor 120ms, cap MAXGAP
+  timer=setTimeout(step,delay);
+}
+function play(){ if(!timeline.length)return;
+  if(cursor>=timeline.length-1)cursor=0;
+  playing=true; $("#rbplay").textContent="⏸"; step(); }
+function pause(){ playing=false; clearTimeout(timer); $("#rbplay").textContent="▶"; }
+
+function enterReplay(){
+  replayOn=true; buildTimeline();
+  $("#replaybar").classList.remove("hidden");
+  $("#replayBtn").textContent="✕ exit replay";
+  $("#rbscrub").max=Math.max(0,timeline.length-1);
+  cursor=0; renderTicks(); applyReveal();
+}
+function exitReplay(){
+  replayOn=false; pause();
+  $("#replaybar").classList.add("hidden");
+  $("#replayBtn").textContent="▶ replay session";
+  document.querySelectorAll("#chain .node.future").forEach(el=>el.classList.remove("future"));
+}
+
+$("#replayBtn").onclick=()=>{ replayOn?exitReplay():enterReplay(); };
+$("#rbplay").onclick=()=>{ playing?pause():play(); };
+$("#rbscrub").oninput=e=>{ pause(); cursor=+e.target.value; applyReveal(); };
 
 const drop=$("#drop"),file=$("#file");
 drop.onclick=()=>file.click();
