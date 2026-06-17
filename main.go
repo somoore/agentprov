@@ -499,10 +499,18 @@ func flatten(v any) string {
 		}
 		return strings.Join(parts, " ")
 	case map[string]any:
-		for _, k := range []string{"text", "content", "command", "output", "stdout"} {
+		for _, k := range []string{"text", "thinking", "content", "command", "output", "stdout"} {
 			if s, ok := x[k]; ok {
 				return flatten(s)
 			}
+		}
+		// Opaque control block (e.g. an extended-thinking signature) — don't
+		// dump its raw JSON as if it were content. Show the type if it has one.
+		if _, hasSig := x["signature"]; hasSig {
+			if t, _ := x["type"].(string); t != "" {
+				return "[" + t + "]"
+			}
+			return ""
 		}
 		b, _ := json.Marshal(x)
 		return string(b)
@@ -512,6 +520,17 @@ func flatten(v any) string {
 }
 
 const detailMax = 600
+
+// isCommandEnvelope reports whether a "user" transcript line is actually a
+// slash-command / local-command / tooling wrapper rather than text the human
+// typed. These carry <command-name>, <local-command-*> etc. tags.
+func isCommandEnvelope(s string) bool {
+	return strings.Contains(s, "<command-name>") ||
+		strings.Contains(s, "<command-message>") ||
+		strings.Contains(s, "<local-command-stdout>") ||
+		strings.Contains(s, "<local-command-caveat>") ||
+		strings.Contains(s, "<command-args>")
+}
 
 // urlRe matches http(s) URLs; egressCmd matches shell tools that reach out.
 var (
@@ -575,17 +594,33 @@ func normalize(raw map[string]any) []Node {
 				n.Op, n.Trust, n.Summary = "assistant", "trusted", "assistant turn"
 				n.Detail = truncRunes(flatten(b["text"]), detailMax)
 				nodes = append(nodes, n)
+			case "thinking", "redacted_thinking":
+				// Extended-thinking block. The text lives in "thinking"; the
+				// "signature" field is an opaque crypto blob — never surface it.
+				n := base
+				n.Op, n.Trust, n.Summary = "assistant", "trusted", "agent thinking"
+				think, _ := b["thinking"].(string)
+				n.Detail = truncRunes(think, detailMax)
+				nodes = append(nodes, n)
 			}
 		}
 		if len(nodes) == 0 {
 			n := base
+			detail := truncRunes(flatten(msg["content"]), detailMax)
 			switch typ {
 			case "user":
-				n.Op, n.Trust, n.Summary = "prompt", "untrusted", "user prompt"
-				n.Detail = truncRunes(flatten(msg["content"]), detailMax)
+				// A "user" line is only a real human prompt if it isn't a
+				// slash-command / local-command / tooling envelope. Those are
+				// plumbing, not something the human typed — labeling them
+				// "HUMAN prompt" is wrong and misleading in a security record.
+				meta, _ := raw["isMeta"].(bool)
+				if meta || isCommandEnvelope(detail) {
+					n.Op, n.Summary, n.Detail = "other", "command/meta", detail
+				} else {
+					n.Op, n.Trust, n.Summary, n.Detail = "prompt", "untrusted", "user prompt", detail
+				}
 			case "assistant":
-				n.Op, n.Trust, n.Summary = "assistant", "trusted", "assistant turn"
-				n.Detail = truncRunes(flatten(msg["content"]), detailMax)
+				n.Op, n.Trust, n.Summary, n.Detail = "assistant", "trusted", "assistant turn", detail
 			default:
 				n.Op, n.Summary = "other", typ
 			}

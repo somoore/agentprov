@@ -84,7 +84,12 @@
   .subhead .txt{color:#f5c47a;font-weight:600;}
   .sub{margin-left:26px;border-left:2px solid rgba(240,168,80,.35);}
   .net{color:#7be3a3;font:12px/1.4 var(--mono);background:rgba(80,220,140,.10);border:1px solid rgba(80,220,140,.3);border-radius:4px;margin:6px 0 0;padding:5px 8px;word-break:break-all;}
-  .detail{color:var(--ink);font:12px/1.45 var(--mono);background:rgba(255,255,255,.04);border-left:2px solid var(--dim);margin:6px 0 0;padding:7px 9px;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow:auto;border-radius:0 4px 4px 0;}
+  .detail{color:var(--dim);font:12px/1.45 var(--mono);background:rgba(255,255,255,.04);border-left:2px solid var(--dim);margin:6px 0 0;padding:7px 9px;white-space:pre-wrap;word-break:break-word;border-radius:0 4px 4px 0;
+    overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:1;max-height:1.6em;}
+  .node.open .detail{color:var(--ink);-webkit-line-clamp:unset;display:block;max-height:340px;overflow:auto;}
+  .node:has(.detail){cursor:pointer;}
+  .node:has(.detail) .seq::after{content:" ▸";color:var(--trusted);}
+  .node.open .seq::after{content:" ▾";}
   .t-untrusted .detail{border-left-color:var(--untrusted);}
 
   .t-trusted .marker{background:var(--trusted);}
@@ -236,7 +241,8 @@ async function render(text){
   const c=res.counts;
   const chip=(html)=>{const e=document.createElement("span");e.className="chip";e.innerHTML=html;return e;};
   if(c.prompt) s.appendChild(chip(`<b>${c.prompt}</b> prompts`));
-  if(c.tool_call) s.appendChild(chip(`<i class="sw" style="background:var(--trusted)"></i><b>${c.tool_call}</b> tool calls${res.tools.length?" · "+res.tools.map(esc).join(", "):""}`));
+  if(c.tool_call){const top=res.tools.slice(0,6).map(esc).join(", ");const more=res.tools.length>6?` +${res.tools.length-6} more`:"";
+    s.appendChild(chip(`<i class="sw" style="background:var(--trusted)"></i><b>${c.tool_call}</b> tool calls${res.tools.length?" · "+top+more:""}`));}
   if(c.tool_result) s.appendChild(chip(`<i class="sw" style="background:var(--untrusted)"></i><b>${c.tool_result}</b> untrusted inputs`));
   s.appendChild(chip(`<b>${res.hb}</b> recorder heartbeats`));
 
@@ -248,7 +254,9 @@ function drawChain(){
   for(let i=0;i<allNodes.length;i++){
     const n=allNodes[i];
     if(isPlumbing(n)&&!showPlumbing) continue;
-    chain.appendChild(nodeEl(n,i,i===lastRes.fb,lastRes.why));
+    const el=nodeEl(n,i,i===lastRes.fb,lastRes.why);
+    if(el.querySelector(".detail")) el.addEventListener("click",()=>el.classList.toggle("open"));
+    chain.appendChild(el);
   }
   if(!lastRes.clean&&lastRes.fb<0){
     const g=document.createElement("div");g.className="gapbar";
