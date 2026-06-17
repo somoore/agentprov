@@ -127,23 +127,38 @@
   .rbnow b{color:var(--ink);}
   .node.future{display:none;}
 
-  /* terminal render */
+  /* terminal render — matched to the approved Claude Code mockup (Menlo, exact palette) */
   .term{background:#1a1d23;border:1px solid #2b3038;border-radius:8px;padding:0;margin:0 0 14px;overflow:hidden;}
-  #termpre{margin:0;padding:16px 18px;font:13px/1.55 var(--mono);color:#c9d1d9;white-space:pre-wrap;word-break:break-word;max-height:560px;overflow:auto;}
+  #termpre{margin:0;padding:16px 20px;
+    font-family:"Menlo","SF Mono",ui-monospace,monospace;font-size:14px;line-height:21px;
+    color:#c9d1d9;white-space:pre-wrap;word-break:break-word;max-height:560px;overflow:auto;}
   #termpre .tdim{color:#7d8590;}
-  #termpre .tcrab{color:#d98a7c;}
-  #termpre .tname{color:#e6edf3;font-weight:700;}
-  #termpre .tuser{color:#adbac7;font-weight:700;}
-  #termpre .tagent{color:#c9d1d9;}
-  #termpre .ttool{color:#e6edf3;}                  /* the ⏺ bullet — white like Claude Code */
-  #termpre .tres{color:#7d8590;}                   /* ⎿ results — dimmed */
-  #termpre .tamber{color:#e3b341;}
-  #termpre .tnet{color:#3fb950;font-weight:700;}
-  #termpre .tsub{color:#d29922;font-weight:700;}
-  #termpre .tbreak{color:#f85149;font-weight:700;}
-  #termpre .trule{color:#2b3038;}
-  #termpre .tcur{background:#c9d1d9;color:#1a1d23;animation:blink 1s steps(1) infinite;}
+  #termpre .tfaint{color:#636c76;}
+  #termpre .tcrab{color:#c96f5f;}
+  #termpre .tname{color:#e6edf3;font-weight:700;}      /* bold tool name / Claude Code */
+  #termpre .tuser{color:#adbac7;}                       /* user prompt text */
+  #termpre .tagent{color:#c9d1d9;}                      /* assistant text */
+  #termpre .ttool{color:#e6edf3;}                       /* the ● bullet */
+  #termpre .tres{color:#7d8590;}                        /* ⎿ results — dimmed */
+  #termpre .tamber{color:#e3b341;}                      /* setup-issue line */
+  #termpre .tnet{color:#3fb950;font-weight:700;}        /* network egress */
+  #termpre .tsub{color:#d29922;font-weight:700;}        /* MCP / subagent */
+  #termpre .tbreak{color:#f85149;font-weight:700;}      /* tamper break */
+  #termpre .tcur{background:#c9d1d9;color:#1a1d23;animation:blink 1.05s steps(1) infinite;}
   @keyframes blink{50%{opacity:0;}}
+  /* banner / footer chrome */
+  .termchrome{background:#1a1d23;font-family:"Menlo","SF Mono",ui-monospace,monospace;font-size:14px;line-height:19px;}
+  .tbanner{display:flex;gap:20px;padding:16px 20px 0;}
+  .tbanner .crab{color:#c96f5f;font-size:13px;line-height:13px;white-space:pre;margin:0;}
+  .tbanner .bcol{display:flex;flex-direction:column;gap:2px;}
+  .tbanner .btitle{color:#e6edf3;font-weight:700;}
+  .tbanner .bver,.tbanner .bdim{color:#7d8590;}
+  .tsetup{padding:6px 20px 4px 64px;color:#e3b341;}
+  .tsetup .d{color:#7d8590;}
+  .tfooter{display:flex;justify-content:space-between;align-items:center;padding:6px 20px 14px;
+    font-family:"Menlo","SF Mono",ui-monospace,monospace;font-size:13px;line-height:18px;color:#636c76;}
+  .tfooter .eff{display:flex;align-items:center;gap:7px;}
+  .tfooter .dot{width:7px;height:7px;border-radius:4px;background:#7d8590;}
 
   /* replay modal */
   .modal{position:fixed;inset:0;z-index:50;background:rgba(8,10,13,.78);backdrop-filter:blur(3px);
@@ -156,8 +171,10 @@
   .tdim2{color:var(--dim);font-weight:400;}
   .modalclose{margin-left:auto;color:var(--dim);font:12px/1 var(--mono);cursor:pointer;padding:6px 10px;border:1px solid var(--line);border-radius:6px;}
   .modalclose:hover{color:var(--ink);border-color:var(--dim);}
-  .modal .term{flex:1;min-height:0;margin:0 0 14px;display:flex;}
+  .modal .term{flex:1;min-height:0;margin:0 0 14px;display:flex;flex-direction:column;}
   .modal #termpre{max-height:none;flex:1;overflow:auto;}
+  .modal .tbanner{flex:0 0 auto;}
+  .modal .tfooter{flex:0 0 auto;border-top:1px solid #2b3038;}
 </style>
 </head>
 <body>
@@ -203,7 +220,11 @@
       <span class="modalclose" id="replayClose">✕ close</span>
     </div>
     <div class="rbnote">⚠ Reconstruction, not a recording — replayed from the signed event chain (UTC timestamps, idle-compressed). Not a screen/disk capture. Every line is a hashed event in the forensic list behind this.</div>
-    <div class="term" id="term"><pre id="termpre"></pre></div>
+    <div class="term" id="term">
+      <div class="termchrome" id="tbannerSlot"></div>
+      <pre id="termpre"></pre>
+      <div class="termchrome" id="tfooterSlot"></div>
+    </div>
     <div class="rbrow">
       <button class="rbplay" id="rbplay">▶</button>
       <div class="rbtrack" id="rbtrack"><div class="rbfill" id="rbfill"></div><div class="rbticks" id="rbticks"></div><input type="range" id="rbscrub" min="0" value="0" step="1"></div>
@@ -415,7 +436,6 @@ function applyReveal(){
 // up to the cursor. Box-drawing chrome + monospace; the last line carries a
 // blinking cursor. This is the signed chain redrawn as the operator's screen —
 // a reconstruction, never a capture.
-const CRAB=["    ╔════╗","   ◗ ●  ● ◖","    ╚════╝"]; // tiny stand-in glyph
 function te(s){ return esc(s==null?"":String(s)); }
 function termLine(x){
   const n=x.n;
@@ -455,13 +475,29 @@ function termLine(x){
     return `<span class="tdim">  · recorder · ${te(n.summary)} · ${fmtClock(x.t)}</span>`;
   return "";
 }
+// The Claude Code welcome crab, as monospace pixel-art (matches the approved mockup).
+const CRAB=["██      ██","  ██████ ","██ ██ ██ ██","██  ████  ██"];
+function bannerHTML(){
+  const crab=CRAB.map(r=>`<span class="tcrab">${r}</span>`).join("\n");
+  // a representative model/cwd line — from chain attrs when present, else generic.
+  const cwd=(allNodes.find(n=>n.attrs&&n.attrs.cwd)||{}).attrs?.cwd||"~";
+  return `<div class="tbanner">`+
+    `<pre class="crab">${crab}</pre>`+
+    `<div class="bcol">`+
+      `<div><span class="btitle">Claude Code</span> <span class="bver">v2.1.179</span></div>`+
+      `<div class="bdim">Opus 4.8 (1M context) · agentprov reconstruction</div>`+
+      `<div class="bdim">${te(cwd)}</div>`+
+    `</div></div>`+
+    `<div class="tsetup"><span>⚠ reconstruction, not a recording</span><span class="d"> · replayed from the signed event chain (UTC)</span></div>`;
+}
+function footerHTML(){
+  const cur=timeline[cursor];
+  const clk=cur?fmtClock(cur.t):"—";
+  return `<div class="tfooter"><span>${cursor+1}/${timeline.length} events · ${clk}</span>`+
+    `<span class="eff"><span class="dot"></span>verified chain · /agentprov</span></div>`;
+}
 function renderTerminal(){
   const pre=$("#termpre");
-  const head=
-    `<span class="tcrab">  (\\(\\</span>   <span class="tname">Claude Code</span> <span class="tdim">session — agentprov reconstruction</span>\n`+
-    `<span class="tcrab">  ( -.-)</span>  <span class="tdim">replayed from a signed, tamper-evident event chain (UTC)</span>\n`+
-    `<span class="tcrab">  o_(")(")</span> <span class="tamber">⚠ reconstruction, not a recording — not a screen/disk capture</span>\n`+
-    `<span class="trule">${"─".repeat(64)}</span>\n`;
   let body="";
   for(let i=0;i<=cursor && i<timeline.length;i++){
     const seg=termLine(timeline[i]);
@@ -471,8 +507,11 @@ function renderTerminal(){
   if(cur && (cur.n.seq===(lastRes.fb>=0?allNodes[lastRes.fb]?.seq:null)))
     body+=`<span class="tbreak">✗ CHAIN BREAKS HERE — record altered. Nothing below can be trusted.</span>\n`;
   body+=`<span class="tcur"> </span>`; // blinking cursor
-  pre.innerHTML=head+body;
+  pre.innerHTML=body;
   pre.scrollTop=pre.scrollHeight;
+  // banner above the scrolling pre, footer below — set once, cheap to rewrite.
+  $("#tbannerSlot").innerHTML=bannerHTML();
+  $("#tfooterSlot").innerHTML=footerHTML();
 }
 
 function step(){
