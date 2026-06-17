@@ -57,6 +57,7 @@ Any change here must preserve all three — they ARE the product:
 go build -o agentprov .
 go vet ./...
 
+./agentprov demo                             # zero-install: bundled sample -> record -> verify -> how to break it
 ./agentprov run -- codex exec 'add a test'   # live: wrap a real agent, record, verify on exit
 ./agentprov record <transcript.jsonl>        # record a past Claude/Codex transcript
 ./agentprov verify chain.jsonl               # integrity + signatures + coverage + liveness

@@ -24,6 +24,34 @@ func awaitInterrupt() <-chan os.Signal {
 //go:embed viewer.html
 var viewerHTML []byte
 
+//go:embed sample.jsonl
+var sampleTranscript []byte
+
+// cmdDemo is the zero-install proof: write the bundled sample transcript, record
+// it to a chain, verify it clean, then tell the user the one command that breaks
+// it. Works with no Claude/Codex install and no transcript of their own.
+func cmdDemo() error {
+	const sample = "agentprov-sample.jsonl"
+	if err := os.WriteFile(sample, sampleTranscript, 0o600); err != nil {
+		return err
+	}
+	fmt.Print("agentprov demo — a tamper-evident record of a (sample) agent run.\n\n")
+	fmt.Printf("1. recording the bundled sample run (%s) ...\n", sample)
+	if err := cmdRecord(sample); err != nil {
+		return err
+	}
+	fmt.Println("\n2. verifying the record:")
+	if err := cmdVerify("chain.jsonl"); err != nil {
+		return err
+	}
+	fmt.Println("\n3. now BREAK it — alter what the agent did, and watch verify fail:")
+	fmt.Println("     agentprov tamper chain.jsonl 7    # rewrite the curl command")
+	fmt.Println("     agentprov verify chain.jsonl      # -> CHAIN BROKEN at seq 7")
+	fmt.Println("\n   or see it in the browser:")
+	fmt.Println("     agentprov view chain.jsonl")
+	return nil
+}
+
 // cmdView serves the embedded viewer + the chain file on loopback and opens a
 // browser at it. Served (not file://) so the viewer can fetch the chain by URL.
 // The viewer is a pure renderer: it recomputes the same hash chain the CLI does,

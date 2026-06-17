@@ -56,9 +56,11 @@ func main() {
 
 func run(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: agentprov <run|record|verify|tamper|drop> ...")
+		return errors.New("usage: agentprov <demo|run|record|verify|view|tamper|drop> ...")
 	}
 	switch args[0] {
+	case "demo":
+		return cmdDemo()
 	case "run":
 		return cmdRun(args[1:])
 	case "record":

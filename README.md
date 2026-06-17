@@ -26,13 +26,29 @@ altered, truncated, or silenced, and the gap looks identical to "the user went t
 
 It's unprivileged, single-binary, and honest about its blind spots (see Coverage).
 
-## Demo — the three proofs
-
-Build it:
+## 60-second demo — no agent install needed
 
 ```bash
 go build -o agentprov .
+./agentprov demo
 ```
+
+`demo` records a bundled sample agent run into a signed, hash-chained record,
+verifies it clean (content, network egress, coverage, liveness), and prints the
+one command that breaks it. Then:
+
+```bash
+$ agentprov tamper chain.jsonl 7   # rewrite what the agent did
+$ agentprov verify chain.jsonl
+agentprov: CHAIN BROKEN at seq 7: content ALTERED (recomputed d1b8... != stored 1e3c...)
+
+$ agentprov view chain.jsonl       # ...and watch it fracture in the browser
+```
+
+That clean → broken flip is the whole thesis in 60 seconds, on data you didn't
+have to produce. Point it at your own runs next — see below.
+
+## Demo — the three proofs
 
 **Record a real agent run, live:**
 
@@ -125,6 +141,7 @@ instrumentation (macOS Endpoint Security / Linux eBPF) and root — a deliberate
 ## Usage
 
 ```
+agentprov demo                   zero-install: record a bundled sample, verify, show how to break it
 agentprov run -- <agent...>      live: wrap a real agent, record, verify on exit
 agentprov record <transcript>    record a past Claude/Codex transcript JSONL
 agentprov verify <chain.jsonl>   integrity + signatures + coverage + liveness
