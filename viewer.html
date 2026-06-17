@@ -130,17 +130,17 @@
   /* terminal render */
   .term{background:#1a1d23;border:1px solid #2b3038;border-radius:8px;padding:0;margin:0 0 14px;overflow:hidden;}
   #termpre{margin:0;padding:16px 18px;font:13px/1.55 var(--mono);color:#c9d1d9;white-space:pre-wrap;word-break:break-word;max-height:560px;overflow:auto;}
-  #termpre .tdim{color:#6b7480;}
-  #termpre .tcrab{color:#e06b6b;}
-  #termpre .tname{color:#e8edf3;font-weight:700;}
-  #termpre .tuser{color:#8aa6ff;font-weight:700;}
+  #termpre .tdim{color:#7d8590;}
+  #termpre .tcrab{color:#d98a7c;}
+  #termpre .tname{color:#e6edf3;font-weight:700;}
+  #termpre .tuser{color:#adbac7;font-weight:700;}
   #termpre .tagent{color:#c9d1d9;}
-  #termpre .ttool{color:#7be3a3;}
-  #termpre .tres{color:#8a929c;}
-  #termpre .tamber{color:#e0b341;}
-  #termpre .tnet{color:#50dc8c;font-weight:700;}
-  #termpre .tsub{color:#e0a050;font-weight:700;}
-  #termpre .tbreak{color:#ff6b6b;font-weight:700;}
+  #termpre .ttool{color:#e6edf3;}                  /* the ⏺ bullet — white like Claude Code */
+  #termpre .tres{color:#7d8590;}                   /* ⎿ results — dimmed */
+  #termpre .tamber{color:#e3b341;}
+  #termpre .tnet{color:#3fb950;font-weight:700;}
+  #termpre .tsub{color:#d29922;font-weight:700;}
+  #termpre .tbreak{color:#f85149;font-weight:700;}
   #termpre .trule{color:#2b3038;}
   #termpre .tcur{background:#c9d1d9;color:#1a1d23;animation:blink 1s steps(1) infinite;}
   @keyframes blink{50%{opacity:0;}}
@@ -418,27 +418,41 @@ function applyReveal(){
 const CRAB=["    ╔════╗","   ◗ ●  ● ◖","    ╚════╝"]; // tiny stand-in glyph
 function te(s){ return esc(s==null?"":String(s)); }
 function termLine(x){
-  const n=x.n, t=fmtClock(x.t);
-  const ts=`<span class="tdim">${t} </span>`;
+  const n=x.n;
+  // condense multi-line content to a single representative line + a +N count.
+  const firstLine=s=>{ s=(s||"").replace(/\t/g," ").trim(); const i=s.indexOf("\n"); return i<0?s:s.slice(0,i); };
+  const moreLines=s=>{ const m=((s||"").match(/\n/g)||[]).length; return m>0?` <span class="tdim">… +${m} lines</span>`:""; };
+
   if(n.op==="prompt")
-    return `\n${ts}<span class="tuser">&gt; </span><span class="tname">${te(n.detail)}</span>`;
-  if(n.op==="assistant")
-    return `${ts}<span class="tagent">${te(n.detail||"…")}</span>`;
-  if(n.op==="subagent")
-    return `\n${ts}<span class="tsub">↳ subagent spawned — ${te(n.agent)}</span>`;
-  if(n.op==="tool_call"){
-    const mcp=n.attrs&&n.attrs.mcp?`<span class="tsub">🔌${te(n.attrs.mcp)} </span>`:"";
-    const arg=n.detail?` <span class="tdim">${te(n.detail).slice(0,100)}</span>`:"";
-    let line=`${ts}<span class="ttool">⏺ ${te(n.tool)}</span>${mcp}${arg}`;
-    if(n.net) line+=`\n${" ".repeat(10)}<span class="tnet">🌐 → ${te(n.net)}</span>`;
-    return line;
+    // user turn — Claude Code shows it as a '>' block, full text, light.
+    return `\n<span class="tuser">&gt;</span> <span class="tuser">${te(n.detail)}</span>\n`;
+
+  if(n.op==="assistant"){
+    const txt=te(n.detail||"").trim();
+    return txt?`<span class="tagent">${txt}</span>`:"";
   }
-  if(n.op==="tool_result")
-    return `${ts}<span class="tres">  ⎿ ${te(n.detail).slice(0,120)}</span>`;
+
+  if(n.op==="subagent")
+    return `\n<span class="tsub">⏺ Task</span><span class="tdim">(${te(n.agent)})</span>`;
+
+  if(n.op==="tool_call"){
+    // ⏺ Tool(condensed args)   — the signature Claude Code tool header
+    const name=n.attrs&&n.attrs.mcp ? te(n.tool).replace(/^mcp__[^_]+(?:_[^_]+)*__/,"") : te(n.tool);
+    const srv=n.attrs&&n.attrs.mcp?`<span class="tsub">${te(n.attrs.mcp)}:</span>`:"";
+    const arg=firstLine(n.detail);
+    const head=`<span class="ttool">⏺</span> <span class="tname">${srv}${name}</span><span class="tdim">(${te(arg).slice(0,120)})</span>`;
+    if(n.net) return head+`\n  <span class="tres">⎿</span>  <span class="tnet">→ ${te(n.net)}</span>`;
+    return head;
+  }
+
+  if(n.op==="tool_result"){
+    const fl=te(firstLine(n.detail)).slice(0,140);
+    return `  <span class="tres">⎿  ${fl}${moreLines(n.detail)}</span>`;
+  }
   if(n.op==="image")
-    return `${ts}<span class="tres">  ⎿ ${te(n.detail)}</span>`;
+    return `  <span class="tres">⎿  ${te(n.detail)}</span>`;
   if(n.op==="heartbeat")
-    return `${ts}<span class="tdim">· recorder ${te(n.summary)}</span>`;
+    return `<span class="tdim">  · recorder · ${te(n.summary)} · ${fmtClock(x.t)}</span>`;
   return "";
 }
 function renderTerminal(){
