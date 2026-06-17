@@ -167,8 +167,10 @@
   .modal{position:fixed;inset:0;z-index:50;background:rgba(8,10,13,.78);backdrop-filter:blur(3px);
     display:flex;align-items:center;justify-content:center;padding:28px;}
   .modalbox{background:var(--panel);border:1px solid var(--line);border-radius:12px;
-    width:min(1040px,96vw);max-height:92vh;display:flex;flex-direction:column;
+    width:min(1040px,96vw);height:88vh;display:flex;flex-direction:column;
     padding:16px 18px;box-shadow:0 24px 80px rgba(0,0,0,.6);}
+  /* both panes fill the tall modal so asciinema-player gets real rows */
+  #verifiedPane,#realPane{flex:1;min-height:0;display:flex;flex-direction:column;}
   .modalhead{display:flex;align-items:center;margin-bottom:10px;}
   .mtitle{font-weight:700;color:var(--ink);font-size:15px;}
   .tdim2{color:var(--dim);font-weight:400;}
