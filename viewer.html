@@ -121,6 +121,7 @@
   .rbtick{position:absolute;top:0;width:1.5px;height:10px;background:rgba(120,230,170,.7);}
   .rbtick.idle{height:18px;width:2px;background:#d9a441;}
   .rbtick.netmark{height:18px;width:2px;background:#50dc8c;}
+  .rbtick.flow{height:18px;width:2px;background:#5ec8e0;}
   .rbtick.brk{height:18px;width:3px;background:var(--bad);}
   .rbclock{color:var(--ink);font:12px/1 var(--mono);flex:0 0 auto;min-width:128px;text-align:right;}
   .rbnow{color:var(--dim);font:12px/1.4 var(--mono);margin-top:10px;min-height:1.4em;}
@@ -148,6 +149,7 @@
   #termpre .tsub{color:#d29922;font-weight:700;}        /* MCP / subagent */
   #termpre .tbreak{color:#f85149;font-weight:700;}      /* tamper break */
   #termpre .tidle{color:#d9a441;font-weight:700;}       /* human idle gap */
+  #termpre .tflow{color:#5ec8e0;font-weight:700;}        /* OS-observed network egress (agentsnitch) */
   #termpre .tcur{background:#c9d1d9;color:#1a1d23;animation:blink 1.05s steps(1) infinite;}
   @keyframes blink{50%{opacity:0;}}
   /* banner / footer chrome */
@@ -303,7 +305,7 @@ async function analyze(nodes){
 }
 
 // classify which nodes are "the story" vs "plumbing"
-const STORY=new Set(["prompt","tool_call","tool_result","assistant","subagent","image","idle_gap","resume"]);
+const STORY=new Set(["prompt","tool_call","tool_result","assistant","subagent","image","idle_gap","resume","flow"]);
 function isPlumbing(n){ return !STORY.has(n.op) && n.op!=="heartbeat"; }
 
 function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
@@ -423,9 +425,15 @@ function tms(t){ const v=Date.parse(t); return isNaN(v)?null:v; }
 
 function buildTimeline(){
   // story+heartbeat nodes that carry a timestamp, sorted by real UTC time.
-  timeline=allNodes.filter(n=>n.time&&(STORY.has(n.op)||n.op==="heartbeat"))
-    .map(n=>({n,t:tms(n.time)})).filter(x=>x.t!=null)
-    .sort((a,b)=>a.t-b.t);
+  const evts=allNodes.filter(n=>n.time&&(STORY.has(n.op)||n.op==="heartbeat"))
+    .map(n=>({n,t:tms(n.time)})).filter(x=>x.t!=null);
+  // merge agentsnitch flow moments as synthetic 'flow' timeline entries so they
+  // interleave by real UTC time and get positioned by index like every event.
+  for(const fm of flowMoments){
+    const t=tms(fm.ts); if(t==null) continue;
+    evts.push({n:{op:"flow",time:fm.ts,flow:fm},t});
+  }
+  timeline=evts.sort((a,b)=>a.t-b.t);
   seqTime={}; for(const n of allNodes) if(n.time) seqTime[n.seq]=tms(n.time);
 }
 
@@ -442,8 +450,9 @@ function renderTicks(){
   timeline.forEach((x,i)=>{
     let cls;
     if(x.n.seq===brkSeq) cls="brk";                          // tamper break
+    else if(x.n.op==="flow") cls="flow";                     // OS-observed egress (agentsnitch)
     else if(x.n.op==="idle_gap") cls="idle";                 // recorded human-idle pause
-    else if(x.n.net) cls="netmark";                          // egress moment
+    else if(x.n.net) cls="netmark";                          // agent-tool egress moment
     else if(x.n.op==="heartbeat") cls="";                    // recorder clock tick
     else return;                                             // not a marked moment
     const d=document.createElement("div");
@@ -516,6 +525,11 @@ function termLine(x){
   }
   if(n.op==="image")
     return `  <span class="tres">⎿  ${te(n.detail)}</span>`;
+  if(n.op==="flow"){
+    const f=n.flow, kb=f.bytes_out?` ${Math.round(f.bytes_out/1024)}KB↑`:"";
+    const conf=f.confidence?` <span class="tdim">[agentsnitch: ${te(f.confidence)} confidence${f.linked_tool?", assoc. tool call":""}]</span>`:"";
+    return `<span class="tflow">🌐 OS-observed egress → ${te(f.host)}${kb}</span>${conf}`;
+  }
   if(n.op==="idle_gap")
     return `\n<span class="tidle">⏸ ── human went idle (no input ≥45s) — recording paused ──</span>`;
   if(n.op==="resume"){
@@ -723,8 +737,30 @@ file.onchange=e=>{const f=e.target.files[0];if(f)f.text().then(render);};
 ["dragenter","dragover"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add("over");}));
 ["dragleave","drop"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove("over");}));
 drop.addEventListener("drop",e=>{const f=e.dataTransfer.files[0];if(f)f.text().then(render);});
+// network-flow overlay (agentsnitch) — fetched once, merged into the timeline.
+let flowMoments=[]; // collapsed distinct egress moments
+function loadFlowOverlay(){
+  return fetch("/flows").then(r=>r.json()).then(fl=>{
+    // collapse 14k raw flows to distinct (host, minute) egress MOMENTS so the
+    // timeline shows meaningful events, not connection churn. Keep the highest
+    // confidence + linked tool seen for each moment.
+    const conf={low:1,medium:2,high:3};
+    const m=new Map();
+    for(const f of fl){
+      if(!f.ts||!f.host) continue;
+      const min=f.ts.slice(0,16); // to the minute
+      const key=f.host+"|"+min;
+      const prev=m.get(key);
+      if(!prev || (conf[f.confidence]||0)>(conf[prev.confidence]||0)){
+        m.set(key,{ts:f.ts,host:f.host,remote:f.remote,confidence:f.confidence,linked_tool:f.linked_tool,why:f.why,bytes_out:f.bytes_out,count:(prev?prev.count:0)+1});
+      } else if(prev){ prev.count++; }
+    }
+    flowMoments=[...m.values()].sort((a,b)=>a.ts.localeCompare(b.ts));
+  }).catch(()=>{ flowMoments=[]; });
+}
+
 const auto=new URLSearchParams(location.search).get("chain");
-if(auto) fetch(auto).then(r=>r.text()).then(render).catch(()=>{});
+if(auto) Promise.all([fetch(auto).then(r=>r.text()), loadFlowOverlay()]).then(([t])=>render(t)).catch(()=>{ if(auto) fetch(auto).then(r=>r.text()).then(render); });
 </script>
 </body>
 </html>
