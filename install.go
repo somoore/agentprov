@@ -16,33 +16,34 @@ import (
 // only stock-macOS path to full session capture. One-time `agentprov install`
 // (e.g. an MDM post-install script); `agentprov uninstall` reverses it.
 //
-// Mechanism: the real `claude` on PATH is a symlink/binary at some absolute
-// path. We move it aside to `<dir>/claude.real` and replace `claude` with a
-// shim that execs `agentprov __shim <claude.real> <args...>`. The shim resolves
-// the real claude by ABSOLUTE path baked at install time, so there's no PATH
-// ambiguity and no risk of the shim invoking itself.
+// We shim at the STABLE PATH NAME the user invokes (e.g. ~/.local/bin/claude),
+// not the versioned binary it may symlink to — so a claude self-update that
+// rewrites versions/ can't bypass the shim. We save the original (the symlink
+// or binary) as <name>.agentprov-real and exec it from the shim.
 
 const shimMarker = "# agentprov-claude-shim" // identifies our shim file
 
-// resolveClaude returns the absolute path `claude` resolves to on PATH, plus
-// whether it's already our shim.
-func resolveClaude() (path string, isShim bool, err error) {
+type claudeState struct {
+	pathName string // the file on PATH the user invokes, e.g. ~/.local/bin/claude
+	realSaved string // where we saved the original: <pathName>.agentprov-real
+	isShim   bool   // pathName is already our shim
+}
+
+func inspectClaude() (claudeState, error) {
 	p, err := exec.LookPath("claude")
 	if err != nil {
-		return "", false, fmt.Errorf("claude not found on PATH: %w", err)
+		return claudeState{}, fmt.Errorf("claude not found on PATH: %w", err)
 	}
 	abs, err := filepath.Abs(p)
 	if err != nil {
-		return "", false, err
+		return claudeState{}, err
 	}
-	// follow symlinks to the real target so we move the actual binary, not a link.
-	if resolved, e := filepath.EvalSymlinks(abs); e == nil {
-		abs = resolved
-	}
+	st := claudeState{pathName: abs, realSaved: abs + ".agentprov-real"}
+	// Is the thing on PATH our shim? (read it if it's a regular file/script)
 	if data, e := os.ReadFile(abs); e == nil && strings.Contains(string(data), shimMarker) {
-		return abs, true, nil
+		st.isShim = true
 	}
-	return abs, false, nil
+	return st, nil
 }
 
 func selfPath() (string, error) {
@@ -50,15 +51,18 @@ func selfPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.EvalSymlinks(p)
+	if r, e := filepath.EvalSymlinks(p); e == nil {
+		return r, nil
+	}
+	return p, nil
 }
 
 func cmdInstall() error {
-	claudePath, isShim, err := resolveClaude()
+	st, err := inspectClaude()
 	if err != nil {
 		return err
 	}
-	if isShim {
+	if st.isShim {
 		fmt.Println("agentprov: claude is already wrapped — auto-recording is active.")
 		fmt.Println("  (run 'agentprov uninstall' to remove it.)")
 		return nil
@@ -68,64 +72,59 @@ func cmdInstall() error {
 		return err
 	}
 
-	dir := filepath.Dir(claudePath)
-	realDest := filepath.Join(dir, "claude.real")
-	// move the real claude aside (idempotent: if claude.real exists, keep it).
-	if _, e := os.Stat(realDest); e != nil {
-		if e := os.Rename(claudePath, realDest); e != nil {
-			return fmt.Errorf("could not move real claude aside (need write to %s): %w", dir, e)
+	// Save the original claude (symlink OR binary) aside, preserving symlinks.
+	// We move the PATH entry itself, then exec the saved copy from the shim.
+	if _, e := os.Lstat(st.realSaved); e != nil { // don't clobber an existing save
+		if e := os.Rename(st.pathName, st.realSaved); e != nil {
+			return fmt.Errorf("could not move claude aside (need write to %s): %w",
+				filepath.Dir(st.pathName), e)
 		}
 	}
 
-	// write the shim where `claude` was, pointing at the absolute real path.
-	shim := shimScript(self, realDest)
-	if e := os.WriteFile(claudePath, []byte(shim), 0o755); e != nil {
-		_ = os.Rename(realDest, claudePath) // roll back the move
-		return fmt.Errorf("could not write shim: %w", e)
+	shim := shimScript(self, st.realSaved)
+	if e := os.WriteFile(st.pathName, []byte(shim), 0o755); e != nil {
+		_ = os.Rename(st.realSaved, st.pathName) // roll back
+		return fmt.Errorf("could not write shim at %s: %w", st.pathName, e)
 	}
 
 	fmt.Printf("agentprov: auto-recording installed.\n")
-	fmt.Printf("  real claude   -> %s\n", realDest)
-	fmt.Printf("  claude (shim) -> %s\n", claudePath)
+	fmt.Printf("  shim          -> %s\n", st.pathName)
+	fmt.Printf("  real claude   -> %s\n", st.realSaved)
 	fmt.Printf("  every 'claude' and 'claude -p' session is now recorded transparently.\n")
 	fmt.Printf("  artifacts: %s/<session-id>/\n", sessionsRoot())
-	fmt.Printf("  reverse with: agentprov uninstall\n")
+	fmt.Printf("  list:  agentprov sessions      ·  reverse:  agentprov uninstall\n")
 	return nil
 }
 
 func cmdUninstall() error {
-	claudePath, isShim, err := resolveClaude()
+	st, err := inspectClaude()
 	if err != nil {
-		return err
+		// claude may not resolve if the shim is broken; try the known save path
+		// relative to common locations isn't reliable, so just report.
+		return fmt.Errorf("could not locate claude on PATH: %w", err)
 	}
-	dir := filepath.Dir(claudePath)
-	realDest := filepath.Join(dir, "claude.real")
-	if !isShim {
-		// claude on PATH isn't our shim; maybe the shim is elsewhere — check the
-		// dir that holds claude.real.
-		if _, e := os.Stat(realDest); e != nil {
-			fmt.Println("agentprov: no shim found — nothing to uninstall.")
-			return nil
-		}
+	if !st.isShim {
+		fmt.Println("agentprov: claude is not wrapped — nothing to uninstall.")
+		return nil
 	}
-	if _, e := os.Stat(realDest); e != nil {
-		return fmt.Errorf("found shim but not %s — refusing to delete claude without its real copy", realDest)
+	if _, e := os.Lstat(st.realSaved); e != nil {
+		return fmt.Errorf("found shim at %s but no saved real claude at %s — refusing to delete the shim without the original",
+			st.pathName, st.realSaved)
 	}
-	// remove the shim, restore the real claude to its original name.
-	shimPath := filepath.Join(dir, "claude")
-	if e := os.Remove(shimPath); e != nil {
+	// remove the shim, restore the saved original to the PATH name.
+	if e := os.Remove(st.pathName); e != nil {
 		return fmt.Errorf("could not remove shim: %w", e)
 	}
-	if e := os.Rename(realDest, shimPath); e != nil {
-		return fmt.Errorf("could not restore real claude: %w", e)
+	if e := os.Rename(st.realSaved, st.pathName); e != nil {
+		return fmt.Errorf("could not restore real claude (saved copy is at %s): %w", st.realSaved, e)
 	}
 	fmt.Println("agentprov: auto-recording removed — claude restored to normal.")
 	return nil
 }
 
-// shimScript is a tiny shell shim: prints the monitored banner, then execs
-// agentprov to transparently parent+record the real claude. It must pass every
-// argument, stdin/stdout/tty, and the exit code through unchanged.
+// shimScript: print nothing here (the monitored banner is the settings.json hook
+// + the recorder's own start line); transparently exec agentprov to parent the
+// real claude. exec replaces the process so exit code/signals pass through.
 func shimScript(agentprovPath, realClaude string) string {
 	return "#!/bin/sh\n" + shimMarker + "\n" +
 		"# Transparent agentprov recorder for claude. Reverse: agentprov uninstall\n" +
@@ -137,11 +136,9 @@ func shellQuote(s string) string {
 }
 
 // cmdShim is the runtime entry the shim execs: agentprov __shim <realclaude> <args...>
-// It records the session via the existing PTY capture, transparently.
 func cmdShim(args []string) error {
 	if len(args) < 1 {
 		return errors.New("__shim requires the real claude path")
 	}
-	// Hand off to the recording run, parenting the real claude with its args.
 	return cmdRunRecorded(args)
 }
