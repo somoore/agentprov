@@ -83,6 +83,7 @@
   .subhead{background:rgba(255,180,80,.12);border-left:3px solid #f0a850;border-radius:0 6px 6px 0;}
   .subhead .txt{color:#f5c47a;font-weight:600;}
   .sub{margin-left:26px;border-left:2px solid rgba(240,168,80,.35);}
+  .net{color:#7be3a3;font:12px/1.4 var(--mono);background:rgba(80,220,140,.10);border:1px solid rgba(80,220,140,.3);border-radius:4px;margin:6px 0 0;padding:5px 8px;word-break:break-all;}
   .detail{color:var(--ink);font:12px/1.45 var(--mono);background:rgba(255,255,255,.04);border-left:2px solid var(--dim);margin:6px 0 0;padding:7px 9px;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow:auto;border-radius:0 4px 4px 0;}
   .t-untrusted .detail{border-left-color:var(--untrusted);}
 
@@ -140,7 +141,7 @@ async function sha256hex(str){
   return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("");
 }
 function hashInput(prev,n){
-  let s=[n.seq,prev,n.op||"",n.agent||"",n.span_id||"",n.parent_span_id||"",n.tool||"",n.trust||"",n.summary||"",n.detail||"",n.time||""].join(NUL);
+  let s=[n.seq,prev,n.op||"",n.agent||"",n.span_id||"",n.parent_span_id||"",n.tool||"",n.trust||"",n.summary||"",n.detail||"",n.net||"",n.time||""].join(NUL);
   const a=n.attrs||{}; for(const k of Object.keys(a).sort()) s+=NUL+k+"="+a[k];
   return s;
 }
@@ -193,11 +194,12 @@ function nodeEl(n,i,broken,why){
   el.className=cls;
   const tool=n.op==="tool_call"&&n.tool?`<span class="tool">${esc(n.tool)}</span>`:"";
   const whyhtml=broken?`<div class="why">⚠ CHAIN BREAKS HERE — ${esc(why)}. Nothing below can be trusted.</div>`:"";
+  const nethtml=n.net?`<div class="net">🌐 NETWORK → ${esc(n.net)}</div>`:"";
   const detailhtml=n.detail?`<pre class="detail">${esc(n.detail)}</pre>`:"";
   const meta=`<span class="meta">${esc(shortTime(n.time))} · ${esc(shortHash(n.hash))}</span>`;
   el.innerHTML=`<div class="rail"><div class="marker"></div></div>
     <div class="body"><div class="line"><span class="op">${esc(n.op||"?")}</span>${tool}
-      <span class="txt">${tool?"":label(n)}</span>${meta}<span class="seq">#${n.seq}</span></div>${detailhtml}${whyhtml}</div>`;
+      <span class="txt">${tool?"":label(n)}</span>${meta}<span class="seq">#${n.seq}</span></div>${nethtml}${detailhtml}${whyhtml}</div>`;
   return el;
 }
 

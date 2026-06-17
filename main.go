@@ -39,6 +39,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -100,6 +101,7 @@ type Node struct {
 	Trust      string            `json:"trust,omitempty"` // trusted | untrusted | unknown
 	Summary    string            `json:"summary,omitempty"` // category label (op-derived)
 	Detail     string            `json:"detail,omitempty"`  // the actual content: prompt text, command+args, tool output
+	Net        string            `json:"net,omitempty"`     // egress host/URL if this tool_call reaches the network (WebFetch/curl/...)
 	Time       string            `json:"time,omitempty"`
 	Attrs      map[string]string `json:"attrs,omitempty"`
 	PrevHash   string            `json:"prev_hash"`
@@ -109,8 +111,8 @@ type Node struct {
 
 func contentHash(prev string, n Node) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%d\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s",
-		n.Seq, prev, n.Op, n.Agent, n.SpanID, n.ParentSpan, n.Tool, n.Trust, n.Summary, n.Detail, n.Time)
+	fmt.Fprintf(h, "%d\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s",
+		n.Seq, prev, n.Op, n.Agent, n.SpanID, n.ParentSpan, n.Tool, n.Trust, n.Summary, n.Detail, n.Net, n.Time)
 	for _, k := range sortedKeys(n.Attrs) {
 		fmt.Fprintf(h, "\x00%s=%s", k, n.Attrs[k])
 	}
@@ -511,6 +513,38 @@ func flatten(v any) string {
 
 const detailMax = 600
 
+// urlRe matches http(s) URLs; egressCmd matches shell tools that reach out.
+var (
+	urlRe     = regexp.MustCompile(`https?://[^\s"'` + "`" + `)]+`)
+	egressCmd = regexp.MustCompile(`\b(curl|wget|nc|ncat|telnet|ssh|scp|rsync|ftp|git\s+(clone|fetch|pull|push)|pip\s+install|npm\s+(install|i)\b|brew\s+install)\b`)
+)
+
+// netHost extracts the egress target from a tool call. For WebFetch/WebSearch
+// the detail IS a URL/query; for a Bash command it's network egress only if the
+// command invokes an egress tool — then we pull the host(s) it talks to. Returns
+// "" when nothing reaches the network. This is honest: it sees ONLY agent-tool
+// egress (the URL/command the agent self-reported), never raw sockets or
+// off-transcript child-process connections (that is the ES/eBPF / agentsnitch tier).
+func netHost(tool, detail string) string {
+	switch tool {
+	case "WebFetch", "WebSearch":
+		if m := urlRe.FindString(detail); m != "" {
+			return truncRunes(m, 120)
+		}
+		return truncRunes(strings.TrimSpace(detail), 120) // WebSearch query
+	case "Bash":
+		if !egressCmd.MatchString(detail) {
+			return ""
+		}
+		if urls := urlRe.FindAllString(detail, 3); len(urls) > 0 {
+			return truncRunes(strings.Join(urls, " "), 120)
+		}
+		// egress tool but no explicit URL (e.g. `git push`, scp host:path)
+		return truncRunes("egress: "+egressCmd.FindString(detail), 60)
+	}
+	return ""
+}
+
 func normalize(raw map[string]any) []Node {
 	if uuid, ok := raw["uuid"].(string); ok { // Claude Code
 		parent, _ := raw["parentUuid"].(string)
@@ -529,6 +563,7 @@ func normalize(raw map[string]any) []Node {
 				n.Tool, _ = b["name"].(string)
 				n.Summary = "tool_use " + n.Tool
 				n.Detail = truncRunes(flatten(b["input"]), detailMax)
+				n.Net = netHost(n.Tool, n.Detail)
 				nodes = append(nodes, n)
 			case "tool_result":
 				n := base
@@ -580,6 +615,7 @@ func normalize(raw map[string]any) []Node {
 			n.Tool, _ = payload["name"].(string)
 			n.Summary = "tool_call " + n.Tool
 			n.Detail = truncRunes(flatten(payload["arguments"]), detailMax)
+			n.Net = netHost(n.Tool, n.Detail)
 		case "function_call_output", "custom_tool_call_output", "patch_apply_end":
 			// tool RESULTS are where untrusted content (file/web/MCP) enters.
 			n.Op, n.Trust, n.Summary = "tool_result", "untrusted", "tool_result"
@@ -606,7 +642,15 @@ func cmdVerify(path string) error {
 	heartbeats := 0
 	cleanExit := false
 	keySource := "unknown"
+	var egress []string
 	for _, n := range nodes {
+		if n.Net != "" {
+			who := n.Agent
+			if who == "" {
+				who = "main"
+			}
+			egress = append(egress, fmt.Sprintf("#%d %s[%s] %s", n.Seq, n.Tool, who, n.Net))
+		}
 		if n.PrevHash != prev {
 			return fmt.Errorf("CHAIN BROKEN at seq %d: prev_hash=%s expected %s — a node was DROPPED, inserted, or reordered",
 				n.Seq, short(n.PrevHash), short(prev))
@@ -639,6 +683,7 @@ func cmdVerify(path string) error {
 	} else {
 		fmt.Printf("provenance: signed by %s key (tamper-evident; keychain unavailable -> not bound away from the agent)\n", keySource)
 	}
+	printNetwork(egress)
 	printCoverage()
 	if !cleanExit {
 		fmt.Printf("liveness:   ⚠ GAP DETECTED — no clean-exit heartbeat. The run was truncated or the recorder\n")
@@ -647,6 +692,21 @@ func cmdVerify(path string) error {
 	}
 	fmt.Printf("liveness:   OK — %d recorder heartbeats, clean exit observed.\n", heartbeats)
 	return nil
+}
+
+// printNetwork lists the egress the agent did through its OWN tools (WebFetch,
+// WebSearch, curl/wget in Bash). It is explicit that this is agent-tool egress
+// only — raw sockets and child-process connections are NOT here (that needs the
+// OS-sensor tier). Showing the targets next to that boundary keeps it honest.
+func printNetwork(egress []string) {
+	fmt.Println("network:    (agent-tool egress only — NOT raw sockets / child processes; that's the OS-sensor tier)")
+	if len(egress) == 0 {
+		fmt.Println("  none — no WebFetch/WebSearch or curl/wget-style egress in the agent's tool calls")
+		return
+	}
+	for _, e := range egress {
+		fmt.Println("  → " + e)
+	}
 }
 
 // printCoverage states, honestly, what this tier of the recorder can and cannot
