@@ -1,0 +1,11 @@
+# build output
+/agentprov
+agentprov
+
+# recorder artifacts
+chain.jsonl
+chain.pub
+*.chain.jsonl
+
+# os
+.DS_Store
