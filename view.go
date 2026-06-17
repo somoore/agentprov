@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -64,6 +66,57 @@ func cmdDemo() error {
 // The viewer is a pure renderer: it recomputes the same hash chain the CLI does,
 // so what you see in the browser is the real verification.
 func cmdView(chainPath string) error { return cmdViewFlows(chainPath, "") }
+
+// renderVideo turns a .cast into a video by RE-RENDERING the recording's frames
+// (agg, then ffmpeg for mp4) — never by capturing the screen. Returns the output
+// path and its content-type. Used by both the CLI and the viewer's /video
+// endpoint, so the user can click a button and get a download. err names exactly
+// what's missing so the UI can tell them how to enable it.
+func renderVideo(castPath, format string) (outPath, contentType string, err error) {
+	if _, e := os.Stat(castPath); e != nil {
+		return "", "", fmt.Errorf("cast not found: %s", castPath)
+	}
+	agg, e := exec.LookPath("agg")
+	if e != nil {
+		return "", "", errors.New("agg-missing")
+	}
+	dir := filepath.Dir(castPath)
+	base := strings.TrimSuffix(filepath.Base(castPath), filepath.Ext(castPath))
+	gifPath := filepath.Join(dir, base+".gif")
+	if out, e := exec.Command(agg, castPath, gifPath).CombinedOutput(); e != nil {
+		return "", "", fmt.Errorf("agg failed: %v\n%s", e, out)
+	}
+	if format == "gif" {
+		return gifPath, "image/gif", nil
+	}
+	// mp4 requested (default): needs ffmpeg; fall back to gif if absent.
+	ff, e := exec.LookPath("ffmpeg")
+	if e != nil {
+		return gifPath, "image/gif", nil // gif is a fine, universally-playable fallback
+	}
+	mp4Path := filepath.Join(dir, base+".mp4")
+	args := []string{"-y", "-i", gifPath, "-movflags", "+faststart",
+		"-pix_fmt", "yuv420p", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", mp4Path}
+	if _, e := exec.Command(ff, args...).CombinedOutput(); e != nil {
+		return gifPath, "image/gif", nil // mp4 step failed; gif still good
+	}
+	return mp4Path, "video/mp4", nil
+}
+
+// cmdVideo is the CLI entry; the viewer uses renderVideo directly via /video.
+func cmdVideo(castPath string) error {
+	out, _, err := renderVideo(castPath, "mp4")
+	if err != nil {
+		if err.Error() == "agg-missing" {
+			fmt.Println("agentprov video needs `agg` (renders the cast frames to video — NO screen capture).")
+			fmt.Println("  install:  brew install agg     ·  for .mp4 also:  brew install ffmpeg")
+			return errors.New("agg not installed")
+		}
+		return err
+	}
+	fmt.Printf("  ✓ %s\n", out)
+	return nil
+}
 
 func cmdViewFlows(chainPath, flowsPath string) error {
 	abs, err := filepath.Abs(chainPath)
@@ -119,6 +172,24 @@ func cmdViewFlows(chainPath, flowsPath string) error {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		http.ServeFile(w, r, castPath)
+	})
+	// render the cast to a video server-side (agg/ffmpeg) and stream it back as
+	// a download — so the user clicks a button, no command, no screen capture.
+	mux.HandleFunc("/video", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("agentprov: rendering session video (agg/ffmpeg)…")
+		out, ct, err := renderVideo(castPath, "mp4")
+		if err != nil {
+			if err.Error() == "agg-missing" {
+				http.Error(w, "agg not installed — run: brew install agg (and ffmpeg for mp4). agg renders the recording frames; it does NOT capture your screen.", http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(w, "render failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", ct)
+		w.Header().Set("Content-Disposition", `attachment; filename="agentprov-session`+filepath.Ext(out)+`"`)
+		http.ServeFile(w, r, out)
+		fmt.Printf("agentprov: served %s\n", out)
 	})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0") // loopback, OS-assigned port

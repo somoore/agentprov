@@ -82,6 +82,12 @@ func run(args []string) error {
 			return errors.New("usage: agentprov verify <chain.jsonl>")
 		}
 		return cmdVerify(args[1])
+	case "video":
+		cast := "session.cast"
+		if len(args) > 1 {
+			cast = args[1]
+		}
+		return cmdVideo(cast)
 	case "view":
 		path := "chain.jsonl"
 		flowsPath := ""

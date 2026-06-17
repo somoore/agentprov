@@ -267,8 +267,8 @@
       <div id="castPlayer"></div>
       <div class="dlrow">
         <button class="dlbtn" id="dlHtml">⤓ Download standalone player (.html)</button>
-        <button class="dlbtn" id="dlVideo">⤓ Record to video (.webm)</button>
-        <span class="dlnote" id="dlNote">offline, opens in any browser · text stays selectable</span>
+        <button class="dlbtn" id="dlVideo">⤓ Download video (.mp4)</button>
+        <span class="dlnote" id="dlNote">rendered from the recording — no screen capture · .html plays anywhere offline</span>
       </div>
     </div>
   </div>
@@ -699,29 +699,26 @@ body{margin:0;background:#0d0f12;color:#c9d1d9;font:13px/1.5 ui-monospace,Menlo,
   setTimeout(()=>{btn.disabled=false; btn.textContent="⤓ Download standalone player (.html)";},1800);
 };
 
-// Record the player to a real .webm via screen capture (getDisplayMedia ->
-// MediaRecorder). Real video, plays in any browser/QuickTime/VLC. Tradeoffs:
-// prompts for screen-share, captures in REAL TIME, .webm (not literal .mp4),
-// pixels (no selectable text). The .html above is the better artifact; this is
-// for when they need a literal video to embed.
+// Download a real video: the agentprov server renders the cast frames to
+// .mp4/.gif (agg/ffmpeg) and streams it back. One click, no command, and
+// crucially NO screen capture — it renders the recording, not your screen.
 $("#dlVideo").onclick=async()=>{
-  const btn=$("#dlVideo");
-  if(!navigator.mediaDevices?.getDisplayMedia){ btn.textContent="not supported in this browser"; return; }
-  btn.disabled=true; btn.textContent="pick this tab to record…";
+  const btn=$("#dlVideo"); btn.disabled=true; btn.textContent="rendering video…";
   try{
-    const stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:30},preferCurrentTab:true});
-    const rec=new MediaRecorder(stream,{mimeType:"video/webm"});
-    const chunks=[];
-    rec.ondataavailable=e=>{ if(e.data.size) chunks.push(e.data); };
-    rec.onstop=()=>{ stream.getTracks().forEach(t=>t.stop()); dl(new Blob(chunks,{type:"video/webm"}),"agentprov-session.webm");
-      btn.disabled=false; btn.textContent="⤓ Record to video (.webm)"; };
-    // restart the recording from 0 and play it through, then stop.
-    if(castPlayer){ castPlayer.seek(0); castPlayer.play(); }
-    rec.start();
-    btn.textContent="● recording (real-time)…";
-    const dur=(castPlayer&&castPlayer.getDuration&&castPlayer.getDuration())||30;
-    setTimeout(()=>{ try{rec.stop();}catch(e){} }, (dur+1.5)*1000);
-  }catch(e){ btn.disabled=false; btn.textContent="⤓ Record to video (.webm)"; console.error(e); }
+    const resp=await fetch("/video");
+    if(!resp.ok){
+      const msg=await resp.text();
+      btn.textContent="⚠ needs agg/ffmpeg on this machine";
+      $("#dlNote").innerHTML="<b style='color:#d9a441'>"+esc(msg)+"</b>";
+      setTimeout(()=>{btn.disabled=false; btn.textContent="⤓ Download video (.mp4)";},5000);
+      return;
+    }
+    const blob=await resp.blob();
+    const ext=(resp.headers.get("content-type")||"").includes("gif")?"gif":"mp4";
+    dl(blob,"agentprov-session."+ext);
+    btn.textContent="✓ downloaded ."+ext;
+  }catch(e){ btn.textContent="failed — see console"; console.error(e); }
+  setTimeout(()=>{btn.disabled=false; btn.textContent="⤓ Download video (.mp4)";},2500);
 };
 
 $("#replayBtn").onclick=enterReplay;
