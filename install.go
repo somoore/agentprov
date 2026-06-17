@@ -122,13 +122,24 @@ func cmdUninstall() error {
 	return nil
 }
 
-// shimScript: print nothing here (the monitored banner is the settings.json hook
-// + the recorder's own start line); transparently exec agentprov to parent the
-// real claude. exec replaces the process so exit code/signals pass through.
+// shimScript builds a FAIL-OPEN shim: it tries to record via agentprov, but if
+// agentprov is missing or won't run, it falls through to the real claude so the
+// user's claude NEVER breaks because of the recorder. A security tool that can
+// take down the thing it watches is a non-starter for a fleet.
+//
+// Implementation: if agentprov is executable, exec it (it parents claude and
+// records). Otherwise exec the real claude directly. We check executability
+// with a cheap `[ -x ]` rather than running agentprov twice.
 func shimScript(agentprovPath, realClaude string) string {
+	ap := shellQuote(agentprovPath)
+	rc := shellQuote(realClaude)
 	return "#!/bin/sh\n" + shimMarker + "\n" +
-		"# Transparent agentprov recorder for claude. Reverse: agentprov uninstall\n" +
-		"exec " + shellQuote(agentprovPath) + " __shim " + shellQuote(realClaude) + " \"$@\"\n"
+		"# Transparent agentprov recorder for claude. Fail-open. Reverse: agentprov uninstall\n" +
+		"if [ -x " + ap + " ]; then\n" +
+		"  exec " + ap + " __shim " + rc + " \"$@\"\n" +
+		"fi\n" +
+		"# recorder unavailable — never break claude:\n" +
+		"exec " + rc + " \"$@\"\n"
 }
 
 func shellQuote(s string) string {
