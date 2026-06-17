@@ -79,3 +79,20 @@ forensic record, and the anomaly sensor in one structure.
   show a forged event fails verify" demo.
 - later (demand-pulled): MCP proxy source, behavioral fingerprinting/anomaly, transparency-log
   anchoring, root-tier ES/eBPF backend for the adversarial threat model.
+
+## Shipped after v1
+
+- **Live capture** (`run -- <agent>`): wrap a real Claude/Codex run, tail its transcript,
+  record into the signed chain, clean-exit heartbeat on process exit. Proven against real Codex.
+- **Keychain-bound signing key**: ed25519 seed in the macOS keychain, unreachable by the agent
+  process -> non-repudiation. Ephemeral fallback off-macOS, stated honestly in verify.
+- **Coverage labeling**: verify prints covered surfaces vs blind spots (off-transcript egress
+  = the privileged ES/eBPF tier) every time. No false completeness.
+- **`analyze` — information-flow taint (IFC)**: the analytic layer the raw recorder lacked.
+  Clean-room re-implementation of the IFC *model* from `sir` (somoore/sir) — session taint
+  propagation across the lethal trifecta (untrusted input -> sensitive read -> exfil sink),
+  flagged in causal order. Detection over the durable record, NOT enforcement: no hooks, no
+  oracle, no blocking. This is the marriage we wanted — sir's IFC brain + agentprov's
+  tamper-evident recording — done as clean re-implementation of the idea, not a code merge.
+  agentprov stays one dependency-free Go file. Proven: trifecta fixture fires, benign run clean,
+  wrong-order (egress-before-secret) correctly NOT flagged.
