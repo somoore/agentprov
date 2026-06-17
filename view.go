@@ -27,6 +27,12 @@ var viewerHTML []byte
 //go:embed sample.jsonl
 var sampleTranscript []byte
 
+//go:embed vendor/asciinema-player.min.js
+var asciinemaJS []byte
+
+//go:embed vendor/asciinema-player.css
+var asciinemaCSS []byte
+
 // cmdDemo is the zero-install proof: write the bundled sample transcript, record
 // it to a chain, verify it clean, then tell the user the one command that breaks
 // it. Works with no Claude/Codex install and no transcript of their own.
@@ -73,6 +79,24 @@ func cmdView(chainPath string) error {
 	mux.HandleFunc("/chain", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		http.ServeFile(w, r, abs)
+	})
+	mux.HandleFunc("/asciinema-player.min.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write(asciinemaJS)
+	})
+	mux.HandleFunc("/asciinema-player.css", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/css")
+		w.Write(asciinemaCSS)
+	})
+	// serve a .cast recording sitting next to the chain, if present.
+	castPath := filepath.Join(filepath.Dir(abs), "session.cast")
+	mux.HandleFunc("/cast", func(w http.ResponseWriter, r *http.Request) {
+		if _, err := os.Stat(castPath); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		http.ServeFile(w, r, castPath)
 	})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0") // loopback, OS-assigned port

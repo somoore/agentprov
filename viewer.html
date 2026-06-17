@@ -178,7 +178,17 @@
   .modal #termpre{max-height:none;flex:1;overflow:auto;}
   .modal .tbanner{flex:0 0 auto;}
   .modal .tfooter{flex:0 0 auto;border-top:1px solid #2b3038;}
+  .modeswitch{display:flex;gap:0;margin-left:18px;border:1px solid var(--line);border-radius:7px;overflow:hidden;}
+  .modebtn{font:12px/1 var(--mono);color:var(--dim);padding:7px 12px;cursor:pointer;background:transparent;}
+  .modebtn.active{background:var(--trusted);color:#06140c;font-weight:700;}
+  .modebtn#modeReal.active{background:#d9a441;color:#161208;}
+  .rbnote-warn{border-left-color:#d9a441;color:#cbb890;}
+  .rbnote-warn b{color:#e6d8b0;}
+  #realPane{flex:1;min-height:0;display:flex;flex-direction:column;}
+  #castPlayer{flex:1;min-height:0;border:1px solid #2b3038;border-radius:8px;overflow:hidden;}
 </style>
+<link rel="stylesheet" href="/asciinema-player.css">
+<script src="/asciinema-player.min.js"></script>
 </head>
 <body>
 <header>
@@ -219,21 +229,33 @@
 <div class="modal hidden" id="replayModal">
   <div class="modalbox">
     <div class="modalhead">
-      <span class="mtitle">Session replay <span class="tdim2">— Claude Code reconstruction</span></span>
+      <span class="mtitle">Session replay</span>
+      <div class="modeswitch hidden" id="modeswitch">
+        <span class="modebtn active" id="modeVerified">✓ Verified replay</span>
+        <span class="modebtn" id="modeReal">▶ Real recording</span>
+      </div>
       <span class="modalclose" id="replayClose">✕ close</span>
     </div>
-    <div class="rbnote">⚠ Reconstruction, not a recording — replayed from the signed event chain (UTC timestamps, idle-compressed). Not a screen/disk capture. Every line is a hashed event in the forensic list behind this.</div>
-    <div class="term" id="term">
-      <div class="termchrome" id="tbannerSlot"></div>
-      <div id="termpre"></div>
-      <div class="termchrome" id="tfooterSlot"></div>
+
+    <div id="verifiedPane">
+      <div class="rbnote">⚠ Reconstruction, not a recording — replayed from the signed event chain (UTC timestamps, idle-compressed). Not a screen/disk capture. Every line is a hashed event in the forensic list behind this.</div>
+      <div class="term" id="term">
+        <div class="termchrome" id="tbannerSlot"></div>
+        <div id="termpre"></div>
+        <div class="termchrome" id="tfooterSlot"></div>
+      </div>
+      <div class="rbrow">
+        <button class="rbplay" id="rbplay">▶</button>
+        <div class="rbtrack" id="rbtrack"><div class="rbfill" id="rbfill"></div><div class="rbticks" id="rbticks"></div><input type="range" id="rbscrub" min="0" value="0" step="1"></div>
+        <span class="rbclock" id="rbclock">—</span>
+      </div>
+      <div class="rbnow" id="rbnow"></div>
     </div>
-    <div class="rbrow">
-      <button class="rbplay" id="rbplay">▶</button>
-      <div class="rbtrack" id="rbtrack"><div class="rbfill" id="rbfill"></div><div class="rbticks" id="rbticks"></div><input type="range" id="rbscrub" min="0" value="0" step="1"></div>
-      <span class="rbclock" id="rbclock">—</span>
+
+    <div id="realPane" class="hidden">
+      <div class="rbnote rbnote-warn">⚠ Real terminal recording — the actual TTY the operator saw, ANSI and all. This is <b>ground truth you can watch</b>, but it is <b>NOT forgery-proof</b>: the agent rendered it and could have lied to the screen. The chain commits to its hash (swap-proof), and <b>verify</b> cross-checks it against the recording's committed SHA-256. Trust the verified replay; <b>watch</b> this.</div>
+      <div id="castPlayer"></div>
     </div>
-    <div class="rbnow" id="rbnow"></div>
   </div>
 </div>
 
@@ -312,13 +334,14 @@ function nodeEl(n,i,broken,why){
   return el;
 }
 
-let allNodes=[], showPlumbing=false, expandAll=true, lastRes=null;
+let allNodes=[], showPlumbing=false, expandAll=true, lastRes=null, castNode=null, castPlayer=null;
 
 async function render(text){
   const nodes=text.split("\n").map(l=>l.trim()).filter(Boolean)
     .map(l=>{try{return JSON.parse(l);}catch{return null;}}).filter(Boolean);
   if(!nodes.length){alert("No chain nodes found in that file.");return;}
   allNodes=nodes;
+  castNode=nodes.find(n=>n.op==="cast_recording")||null;
   const res=lastRes=await analyze(nodes);
   $("#drop").style.display="none";
   $("#view").classList.remove("hidden");
@@ -580,11 +603,34 @@ function enterReplay(){
   $("#tbannerSlot").innerHTML=bannerHTML();   // static — render once
   $("#tfooterSlot").innerHTML=footerHTML();   // shell once; counts update in place
   renderTicks(); applyReveal();
+  // show the verified/real switch only when a real recording is attached.
+  $("#modeswitch").classList.toggle("hidden", !castNode);
+  showMode("verified");
 }
 function exitReplay(){
   replayOn=false; pause();
+  if(castPlayer){ try{castPlayer.dispose();}catch(e){} castPlayer=null; }
   $("#replayModal").classList.add("hidden");
 }
+
+// switch between the verified reconstruction and the real .cast recording.
+function showMode(mode){
+  const real=mode==="real";
+  $("#verifiedPane").classList.toggle("hidden", real);
+  $("#realPane").classList.toggle("hidden", !real);
+  $("#modeVerified").classList.toggle("active", !real);
+  $("#modeReal").classList.toggle("active", real);
+  if(real){ pause(); mountCast(); }
+}
+function mountCast(){
+  if(castPlayer) return; // already mounted
+  if(!window.AsciinemaPlayer){ $("#castPlayer").innerHTML="<div style='padding:16px;color:#cbb890;font:13px monospace'>player not loaded</div>"; return; }
+  castPlayer=AsciinemaPlayer.create("/cast", $("#castPlayer"), {
+    autoPlay:false, theme:"asciinema", fit:"both", terminalFontSize:"14px"
+  });
+}
+$("#modeVerified").onclick=()=>showMode("verified");
+$("#modeReal").onclick=()=>showMode("real");
 
 $("#replayBtn").onclick=enterReplay;
 $("#replayClose").onclick=exitReplay;
