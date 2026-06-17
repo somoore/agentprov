@@ -133,6 +133,7 @@
 
     <div class="secthead">
       <span>What the agent did</span><div class="ln"></div>
+      <span class="toggle" id="expand">collapse all</span>
       <span class="toggle" id="toggle">show plumbing</span>
     </div>
     <div class="chain" id="chain"></div>
@@ -214,7 +215,7 @@ function nodeEl(n,i,broken,why){
   return el;
 }
 
-let allNodes=[], showPlumbing=false, lastRes=null;
+let allNodes=[], showPlumbing=false, expandAll=true, lastRes=null;
 
 async function render(text){
   const nodes=text.split("\n").map(l=>l.trim()).filter(Boolean)
@@ -261,7 +262,7 @@ function drawChain(){
     const n=allNodes[i];
     if(isPlumbing(n)&&!showPlumbing) continue;
     const el=nodeEl(n,i,i===lastRes.fb,lastRes.why);
-    if(el.querySelector(".detail")) el.addEventListener("click",()=>el.classList.toggle("open"));
+    if(el.querySelector(".detail")){ if(expandAll)el.classList.add("open"); el.addEventListener("click",()=>el.classList.toggle("open")); }
     chain.appendChild(el);
   }
   if(!lastRes.clean&&lastRes.fb<0){
@@ -272,6 +273,7 @@ function drawChain(){
 }
 
 $("#toggle").onclick=()=>{showPlumbing=!showPlumbing;$("#toggle").textContent=showPlumbing?"hide plumbing":"show plumbing";drawChain();};
+$("#expand").onclick=()=>{expandAll=!expandAll;$("#expand").textContent=expandAll?"collapse all":"expand all";drawChain();};
 
 const drop=$("#drop"),file=$("#file");
 drop.onclick=()=>file.click();
