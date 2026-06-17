@@ -230,6 +230,71 @@ customer-owned sink (S3 / Security Lake)
         |    search only, NOT detection; embed LAZILY (the sliver investigated), not the firehose
 ```
 
+### Two deployment shapes: ON-DEVICE binary vs CLOUD pipeline (same core)
+
+The everything above is the CLOUD pipeline (Lambda/Firehose/SIEM). There is a second shape that
+may be the better STARTING point. The decode->redact->hash-chain-sign->record core is identical;
+only WHERE it runs differs. They serve different buyers; build the binary first (ships now, no
+customer cloud), grow into the pipeline for fleets.
+
+**On-device: a small binary rides shotgun to the agent.**
+- Capture: point the agent's `OTEL_EXPORTER_OTLP_ENDPOINT` at the binary on `127.0.0.1`. The
+  binary is a tiny LOCAL OTLP RECEIVER — same protocol the Lambda decodes, just local. (Cleaner
+  than transcript-tailing, which still works as a fallback / for agents w/o OTel.)
+- Process on device: decode -> redact -> hash-chain-SIGN -> record. Locally, before anything
+  leaves the machine.
+- **This SIGNS AT SOURCE** — closing the cloud design's honest gap (the unsigned endpoint->Lambda
+  hop). The tamper-evidence now genuinely starts the moment the agent emitted the event. Stronger
+  security claim, the one a security person actually wants.
+
+Wins vs cloud: trust maximal (sign at source); cost ~0 (endpoint's own idle compute, no
+Lambda/Firehose/S3); scale non-existent (100 endpoints = 100 independent local recorders, shards
+by definition — the whole conserved-rate/Firehose analysis simply doesn't apply); AND it ships
+NOW with no customer cloud account (it IS the local `agentprov` artifact already built).
+
+Honest costs / unavoidable tensions:
+1. **The recorder lives on the machine it distrusts.** A popped endpoint can reach the binary's
+   key / kill the process / feed it garbage. Mitigate: key in Secure Enclave; the gap-heartbeat
+   already built detects the recorder being silenced. But you CANNOT fully solve "the watched can
+   reach the watcher" without kernel privilege — the root requirement correctly refused. So:
+   on-device = BETTER provenance (sign at source), WEAKER recorder-tamper-resistance (on hostile
+   host). Genuine tension, not a fixable bug.
+2. **Enterprise deployment headwind.** A binary on every dev machine is an MDM/fleet problem
+   enterprises dislike, and it competes with their EDR agent. "Another endpoint agent" is a hard
+   top-down sell — which is exactly why on-device is a BOTTOM-UP (developer / small-team /
+   self-serve) motion, and the cloud pipeline is the TOP-DOWN (sell-to-security-team) motion.
+
+**Dual destinations (the binary is the fan-out point).** Security teams still want OTel in their
+SIEM — so the binary receives from the agent (one endpoint) and fans out to two:
+- **-> SIEM**: ship the OTel onward to their Splunk/CrowdStrike HEC, **signed-in-transit** (chain
+  signature added as fields). The team's existing dashboards/rules are UNDISTURBED, and the SIEM
+  copy is now itself verifiable. Pitch: "your SIEM keeps getting everything it always did — we
+  just made it tamper-evident at the source." Not "two outputs"; a free integrity upgrade to their
+  existing stream.
+- **-> record**: the full tamper-evident chain (local file / S3 / later Firehose).
+
+Config-driven, each destination independently toggleable:
+```toml
+[receive]
+listen = "127.0.0.1:4317"                 # the agent points its OTLP here
+[destinations.siem]
+enabled = true
+otlp_endpoint = "https://splunk-hec..."   # the team's existing target
+sign_in_transit = true                    # add chain signature to the SIEM copy
+[destinations.record]
+enabled = true
+sink = "local"                            # local | s3://... | firehose
+```
+
+CAUTION: do NOT let "two destinations" drift the binary into a routing/forwarding PRODUCT
+(Cribl/Vector territory — crowded). The binary's JOB is record-and-sign; the SIEM passthrough is
+a courtesy so the team loses nothing, not the core value. Framing stays: "we sign and record your
+agent telemetry on-device, and pass it through to your SIEM untouched (plus signed)."
+
+This resolves the on-device vs cloud tension: binary signs at source (best trust), security team
+still gets their SIEM stream (no workflow change, no "give up your SIEM"), and you ship without
+building the whole cloud pipeline. Cloud pipeline = the fleet-scale upgrade, pulled later.
+
 ### Product surface: click-to-install app in the customer's SIEM/EDR console
 
 Meet the buyer in the console they already use. Researched install surfaces:
@@ -268,6 +333,11 @@ Meet the buyer in the console they already use. Researched install surfaces:
 7. **Process lazily, at investigation time.** Flight-recorder principle applied to compute:
    capture everything cheaply now, verify/analyze/embed the sliver you investigate later. The only
    always-on processing is a tiny per-batch metadata-loader Lambda; everything else is on-read.
+8. **One core, two deployment shapes; ship on-device first.** decode->redact->sign->record is
+   written once and runs either in a local binary (bottom-up, sign-at-source, ships now) or a
+   cloud Lambda (top-down, fleet-scale). On-device is the starting product; cloud is the scale-up.
+   The binary fans out to SIEM (signed-in-transit, undisturbed) + record — but stays a recorder,
+   never drifts into a telemetry-routing product.
 
 ### Status of this architecture
 
