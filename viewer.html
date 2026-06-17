@@ -126,6 +126,24 @@
   .rbnow{color:var(--dim);font:12px/1.4 var(--mono);margin-top:10px;min-height:1.4em;}
   .rbnow b{color:var(--ink);}
   .node.future{display:none;}
+
+  /* terminal render */
+  .term{background:#1a1d23;border:1px solid #2b3038;border-radius:8px;padding:0;margin:0 0 14px;overflow:hidden;}
+  #termpre{margin:0;padding:16px 18px;font:13px/1.55 var(--mono);color:#c9d1d9;white-space:pre-wrap;word-break:break-word;max-height:560px;overflow:auto;}
+  #termpre .tdim{color:#6b7480;}
+  #termpre .tcrab{color:#e06b6b;}
+  #termpre .tname{color:#e8edf3;font-weight:700;}
+  #termpre .tuser{color:#8aa6ff;font-weight:700;}
+  #termpre .tagent{color:#c9d1d9;}
+  #termpre .ttool{color:#7be3a3;}
+  #termpre .tres{color:#8a929c;}
+  #termpre .tamber{color:#e0b341;}
+  #termpre .tnet{color:#50dc8c;font-weight:700;}
+  #termpre .tsub{color:#e0a050;font-weight:700;}
+  #termpre .tbreak{color:#ff6b6b;font-weight:700;}
+  #termpre .trule{color:#2b3038;}
+  #termpre .tcur{background:#c9d1d9;color:#1a1d23;animation:blink 1s steps(1) infinite;}
+  @keyframes blink{50%{opacity:0;}}
 </style>
 </head>
 <body>
@@ -168,6 +186,9 @@
       <div class="rbnow" id="rbnow"></div>
     </div>
 
+    <div class="term hidden" id="term"><pre id="termpre"></pre></div>
+
+    <div class="secthead" id="listhead" style="margin-top:18px"><span>Full event list (forensic)</span><div class="ln"></div></div>
     <div class="chain" id="chain"></div>
   </div>
 </div>
@@ -376,6 +397,59 @@ function applyReveal(){
     const liveEl=document.querySelector(`#chain .node[data-seq="${cur.n.seq}"]`);
     if(liveEl&&playing) liveEl.scrollIntoView({block:"center",behavior:"smooth"});
   }
+  renderTerminal();
+}
+
+// ── terminal render ─────────────────────────────────────────────────────────
+// Re-render the run as a Claude-Code-style terminal session, revealing events
+// up to the cursor. Box-drawing chrome + monospace; the last line carries a
+// blinking cursor. This is the signed chain redrawn as the operator's screen —
+// a reconstruction, never a capture.
+const CRAB=["    ╔════╗","   ◗ ●  ● ◖","    ╚════╝"]; // tiny stand-in glyph
+function te(s){ return esc(s==null?"":String(s)); }
+function termLine(x){
+  const n=x.n, t=fmtClock(x.t);
+  const ts=`<span class="tdim">${t} </span>`;
+  if(n.op==="prompt")
+    return `\n${ts}<span class="tuser">&gt; </span><span class="tname">${te(n.detail)}</span>`;
+  if(n.op==="assistant")
+    return `${ts}<span class="tagent">${te(n.detail||"…")}</span>`;
+  if(n.op==="subagent")
+    return `\n${ts}<span class="tsub">↳ subagent spawned — ${te(n.agent)}</span>`;
+  if(n.op==="tool_call"){
+    const mcp=n.attrs&&n.attrs.mcp?`<span class="tsub">🔌${te(n.attrs.mcp)} </span>`:"";
+    const arg=n.detail?` <span class="tdim">${te(n.detail).slice(0,100)}</span>`:"";
+    let line=`${ts}<span class="ttool">⏺ ${te(n.tool)}</span>${mcp}${arg}`;
+    if(n.net) line+=`\n${" ".repeat(10)}<span class="tnet">🌐 → ${te(n.net)}</span>`;
+    return line;
+  }
+  if(n.op==="tool_result")
+    return `${ts}<span class="tres">  ⎿ ${te(n.detail).slice(0,120)}</span>`;
+  if(n.op==="image")
+    return `${ts}<span class="tres">  ⎿ ${te(n.detail)}</span>`;
+  if(n.op==="heartbeat")
+    return `${ts}<span class="tdim">· recorder ${te(n.summary)}</span>`;
+  return "";
+}
+function renderTerminal(){
+  const pre=$("#termpre");
+  const branch=allNodes.find(n=>n.op!=="heartbeat"&&n.attrs&&n.attrs.cwd);
+  const head=
+    `<span class="tcrab">  (\\(\\</span>   <span class="tname">Claude Code</span> <span class="tdim">session — agentprov reconstruction</span>\n`+
+    `<span class="tcrab">  ( -.-)</span>  <span class="tdim">replayed from a signed, tamper-evident event chain (UTC)</span>\n`+
+    `<span class="tcrab">  o_(")(")</span> <span class="tamber">⚠ reconstruction, not a recording — not a screen/disk capture</span>\n`+
+    `<span class="trule">${"─".repeat(64)}</span>\n`;
+  let body="";
+  for(let i=0;i<=cursor && i<timeline.length;i++){
+    const seg=termLine(timeline[i]);
+    if(seg) body+=seg+"\n";
+  }
+  const cur=timeline[cursor];
+  if(cur && (cur.n.seq===(lastRes.fb>=0?allNodes[lastRes.fb]?.seq:null)))
+    body+=`<span class="tbreak">✗ CHAIN BREAKS HERE — record altered. Nothing below can be trusted.</span>\n`;
+  body+=`<span class="tcur"> </span>`; // blinking cursor
+  pre.innerHTML=head+body;
+  pre.scrollTop=pre.scrollHeight;
 }
 
 function step(){
@@ -394,6 +468,7 @@ function pause(){ playing=false; clearTimeout(timer); $("#rbplay").textContent="
 function enterReplay(){
   replayOn=true; buildTimeline();
   $("#replaybar").classList.remove("hidden");
+  $("#term").classList.remove("hidden");
   $("#replayBtn").textContent="✕ exit replay";
   $("#rbscrub").max=Math.max(0,timeline.length-1);
   cursor=0; renderTicks(); applyReveal();
@@ -401,6 +476,7 @@ function enterReplay(){
 function exitReplay(){
   replayOn=false; pause();
   $("#replaybar").classList.add("hidden");
+  $("#term").classList.add("hidden");
   $("#replayBtn").textContent="▶ replay session";
   document.querySelectorAll("#chain .node.future").forEach(el=>el.classList.remove("future"));
 }
