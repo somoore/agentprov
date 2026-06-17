@@ -83,19 +83,24 @@ func run(args []string) error {
 			return errors.New("usage: agentprov record <transcript.jsonl>")
 		}
 		return cmdRecord(args[1])
+	case "sessions":
+		return cmdSessions()
 	case "verify":
-		if len(args) < 2 {
-			return errors.New("usage: agentprov verify <chain.jsonl>")
+		path := chainArgOrLatest(args[1:])
+		if path == "" {
+			return errors.New("no chain given and no recorded sessions found (run a session first, or pass a chain.jsonl)")
 		}
-		return cmdVerify(args[1])
+		return cmdVerify(path)
 	case "video":
 		cast := "session.cast"
 		if len(args) > 1 {
 			cast = args[1]
+		} else if d := latestSessionDir(); d != "" {
+			cast = filepath.Join(d, "session.cast")
 		}
 		return cmdVideo(cast)
 	case "view":
-		path := "chain.jsonl"
+		path := ""
 		flowsPath := ""
 		rest := args[1:]
 		for i := 0; i < len(rest); i++ {
@@ -104,6 +109,15 @@ func run(args []string) error {
 				i++
 			} else {
 				path = rest[i]
+			}
+		}
+		if path == "" {
+			// default to the latest recorded session, else ./chain.jsonl
+			if d := latestSessionDir(); d != "" {
+				path = filepath.Join(d, "chain.jsonl")
+				fmt.Printf("agentprov: viewing latest session: %s\n", d)
+			} else {
+				path = "chain.jsonl"
 			}
 		}
 		return cmdViewFlows(path, flowsPath)
@@ -496,6 +510,95 @@ func newSessionDir() string {
 // writePubFileAt writes the verify pubkey next to a chain.
 func writePubFileAt(pub ed25519.PublicKey, path string) error {
 	return os.WriteFile(path, []byte(hex.EncodeToString(pub)+"\n"), 0o600)
+}
+
+// latestSessionDir returns the most recently modified recorded session dir, or
+// "" if none. Lets `view`/`verify`/`video` default to the last session.
+func latestSessionDir() string {
+	root := sessionsRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	var newest string
+	var newestMod time.Time
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if newest == "" || info.ModTime().After(newestMod) {
+			// require a chain.jsonl inside
+			cp := filepath.Join(root, e.Name(), "chain.jsonl")
+			if _, err := os.Stat(cp); err == nil {
+				newest, newestMod = filepath.Join(root, e.Name()), info.ModTime()
+			}
+		}
+	}
+	return newest
+}
+
+// chainArgOrLatest returns an explicit chain path if given, else the latest
+// session's chain, else "".
+func chainArgOrLatest(rest []string) string {
+	if len(rest) > 0 && rest[0] != "" {
+		return rest[0]
+	}
+	if d := latestSessionDir(); d != "" {
+		return filepath.Join(d, "chain.jsonl")
+	}
+	return ""
+}
+
+// cmdSessions lists recorded sessions, most recent first, so a user can find and
+// open them — they land in ~/.agentprov/sessions/ from the transparent shim.
+func cmdSessions() error {
+	root := sessionsRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) == 0 {
+		fmt.Printf("no recorded sessions in %s\n", root)
+		fmt.Println("(record one with 'agentprov run -- claude', or 'agentprov install' for auto-recording)")
+		return nil
+	}
+	type sess struct {
+		dir   string
+		mod   time.Time
+		nodes int
+		cast  int64
+	}
+	var list []sess
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, e.Name())
+		cp := filepath.Join(dir, "chain.jsonl")
+		fi, err := os.Stat(cp)
+		if err != nil {
+			continue
+		}
+		nodes := 0
+		if nn, e := loadChain(cp); e == nil {
+			nodes = len(nn)
+		}
+		var castSize int64
+		if ci, e := os.Stat(filepath.Join(dir, "session.cast")); e == nil {
+			castSize = ci.Size()
+		}
+		list = append(list, sess{dir, fi.ModTime(), nodes, castSize})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].mod.After(list[j].mod) })
+	fmt.Printf("recorded sessions (%s):\n\n", root)
+	for _, s := range list {
+		fmt.Printf("  %s   %d nodes · %dKB recording · %s\n",
+			s.mod.Format("2006-01-02 15:04"), s.nodes, s.cast/1024, filepath.Base(s.dir))
+		fmt.Printf("      view: agentprov view %s\n", filepath.Join(s.dir, "chain.jsonl"))
+	}
+	fmt.Printf("\nlatest: agentprov view    (no args defaults to the most recent session)\n")
+	return nil
 }
 
 // transcriptDirFor returns the dir an agent writes its session JSONL into.
