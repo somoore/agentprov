@@ -60,6 +60,12 @@ func run(args []string) error {
 	switch args[0] {
 	case "demo":
 		return cmdDemo()
+	case "install":
+		return cmdInstall()
+	case "uninstall":
+		return cmdUninstall()
+	case "__shim": // internal: invoked by the claude shim, not by users
+		return cmdShim(args[1:])
 	case "attach-cast":
 		if len(args) < 3 {
 			return errors.New("usage: agentprov attach-cast <chain.jsonl> <session.cast>")
@@ -356,24 +362,36 @@ func cmdRun(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: agentprov run -- <agent command...>   e.g. agentprov run -- codex exec 'add a test'")
 	}
+	return runRecorded(args, ".", false)
+}
+
+// cmdRunRecorded is the transparent path used by the claude shim: record the
+// session into a per-session dir under the sessions root, quietly (so the user's
+// claude experience is unchanged), and pass the real claude's exit code through.
+func cmdRunRecorded(args []string) error {
+	dir := newSessionDir()
+	return runRecorded(args, dir, true)
+}
+
+// runRecorded launches args[0] under PTY capture, recording the chain + cast into
+// outDir. quiet suppresses agentprov's own chatter (for the transparent shim).
+// Returns the AGENT's exit error so the caller can propagate its exit code.
+func runRecorded(args []string, outDir string, quiet bool) error {
 	priv, pub, keySource, err := loadOrCreateSigningKey()
 	if err != nil {
 		return err
 	}
-	if err := writePubFile(pub); err != nil {
-		return err
-	}
+	pubPath := filepath.Join(outDir, "chain.pub")
+	_ = writePubFileAt(pub, pubPath)
 
-	// Watch the agent's transcript dir if we know it; the file it creates after
-	// launch is ours. If we don't recognize the agent, we still capture the
-	// terminal recording — the .cast doesn't depend on a transcript.
 	watchDir, knowsTranscript := transcriptDirFor(args[0])
 	var before map[string]bool
 	if knowsTranscript {
 		before = snapshotJSONL(watchDir)
 	}
 
-	out, err := os.Create("chain.jsonl")
+	chainPath := filepath.Join(outDir, "chain.jsonl")
+	out, err := os.Create(chainPath)
 	if err != nil {
 		return err
 	}
@@ -381,9 +399,11 @@ func cmdRun(args []string) error {
 	rec := newRecorder(bufio.NewWriter(out), priv)
 	rec.emit(Node{Op: "heartbeat", Summary: "recorder start", Attrs: map[string]string{"key": keySource, "agent": args[0]}})
 
-	const castPath = "session.cast"
-	fmt.Printf("agentprov: recording live (%s key) + terminal -> %s. launching: %s\n\n",
-		keySource, castPath, strings.Join(args, " "))
+	castPath := filepath.Join(outDir, "session.cast")
+	if !quiet {
+		fmt.Printf("agentprov: recording live (%s key) + terminal -> %s. launching: %s\n\n",
+			keySource, castPath, strings.Join(args, " "))
+	}
 	cmd := exec.Command(args[0], args[1:]...)
 
 	// Tail the transcript in the background while the agent runs in the PTY
@@ -449,9 +469,33 @@ func cmdRun(args []string) error {
 	}
 	rec.w.Flush()
 
-	fmt.Printf("\nagentprov: recorded %d nodes (%d agent events) -> chain.jsonl + %s\n", rec.seq, agentEvents, castPath)
-	fmt.Printf("watch + verify with: agentprov view chain.jsonl   /   agentprov verify chain.jsonl\n")
-	return nil
+	if !quiet {
+		fmt.Printf("\nagentprov: recorded %d nodes (%d agent events) -> %s + %s\n", rec.seq, agentEvents, chainPath, castPath)
+		fmt.Printf("watch + verify with: agentprov view %s   /   agentprov verify %s\n", chainPath, chainPath)
+	}
+	// Propagate the agent's exit code so the shim is transparent.
+	return waitErr
+}
+
+// sessionsRoot is where transparently-recorded sessions land: ~/.agentprov/sessions
+func sessionsRoot() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".agentprov", "sessions")
+}
+
+// newSessionDir creates a fresh per-session dir. Name uses pid + a short random
+// suffix from the clock-free counter (Date.now is fine here; this is the CLI).
+func newSessionDir() string {
+	base := sessionsRoot()
+	id := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()%1000000)
+	dir := filepath.Join(base, id)
+	_ = os.MkdirAll(dir, 0o700)
+	return dir
+}
+
+// writePubFileAt writes the verify pubkey next to a chain.
+func writePubFileAt(pub ed25519.PublicKey, path string) error {
+	return os.WriteFile(path, []byte(hex.EncodeToString(pub)+"\n"), 0o600)
 }
 
 // transcriptDirFor returns the dir an agent writes its session JSONL into.
