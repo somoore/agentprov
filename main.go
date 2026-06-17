@@ -604,13 +604,34 @@ func cmdSessions() error {
 // transcriptDirFor returns the dir an agent writes its session JSONL into.
 func transcriptDirFor(agent string) (string, bool) {
 	home, _ := os.UserHomeDir()
-	switch filepath.Base(agent) {
-	case "claude":
+	base := filepath.Base(agent)
+	// The shim execs the REAL claude under a renamed path (claude.agentprov-real,
+	// claude.real) or even a version filename (e.g. 2.1.179). Detect by the
+	// agentLooksLike heuristic, not an exact basename, so transcript tailing —
+	// and therefore the verified chain — still works under the shim.
+	if agentLooksLike(agent, "claude") {
 		return filepath.Join(home, ".claude", "projects"), true
-	case "codex":
+	}
+	if agentLooksLike(agent, "codex") {
 		return filepath.Join(home, ".codex", "sessions"), true
 	}
+	_ = base
 	return "", false
+}
+
+// agentLooksLike reports whether an agent path is the named agent, tolerating
+// the shim's renamed binaries and Claude's version-named binaries.
+func agentLooksLike(agentPath, name string) bool {
+	base := strings.ToLower(filepath.Base(agentPath))
+	if base == name || strings.HasPrefix(base, name+".") || strings.HasPrefix(base, name+"-") {
+		return true // claude, claude.real, claude.agentprov-real, claude-2.1.179
+	}
+	// Claude's on-disk binaries live in .../claude/versions/<ver> — detect by
+	// the parent path containing the agent name.
+	if strings.Contains(strings.ToLower(agentPath), string(filepath.Separator)+name+string(filepath.Separator)) {
+		return true
+	}
+	return false
 }
 
 func snapshotJSONL(dir string) map[string]bool {

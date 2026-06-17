@@ -31,3 +31,20 @@ func TestUTF8BoundarySplit(t *testing.T) {
 		}
 	}
 }
+
+func TestAgentLooksLike(t *testing.T) {
+	cases := []struct{ path, name string; want bool }{
+		{"/Users/x/.local/bin/claude.agentprov-real", "claude", true},
+		{"/Users/x/.local/share/claude/versions/claude.real", "claude", true},
+		{"/Users/x/.local/share/claude/versions/2.1.179", "claude", true},
+		{"/usr/bin/codex", "claude", false},
+		{"/usr/bin/node", "claude", false},
+		{"claude", "claude", true},
+		{"/usr/bin/codex", "codex", true},
+	}
+	for _, c := range cases {
+		if got := agentLooksLike(c.path, c.name); got != c.want {
+			t.Errorf("agentLooksLike(%q,%q)=%v want %v", c.path, c.name, got, c.want)
+		}
+	}
+}
