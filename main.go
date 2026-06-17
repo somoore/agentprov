@@ -30,6 +30,7 @@ package main
 import (
 	"bufio"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -399,9 +400,17 @@ func runRecorded(args []string, outDir string, quiet bool) error {
 	_ = writePubFileAt(pub, pubPath)
 
 	watchDir, knowsTranscript := transcriptDirFor(args[0])
-	var before map[string]bool
-	if knowsTranscript {
-		before = snapshotJSONL(watchDir)
+	isClaude := knowsTranscript && agentLooksLike(args[0], "claude")
+
+	// PRECISE transcript targeting: for claude, force a known session ID with
+	// --session-id <uuid> and tail exactly <uuid>.jsonl. This replaces the
+	// fragile "newest .jsonl in the dir" heuristic, which grabbed the WRONG
+	// transcript when another claude session (e.g. the operator's own) was more
+	// recently active — producing an empty/wrong verified chain.
+	sessionID := ""
+	if isClaude && !claudeHasSessionFlag(args) {
+		sessionID = newUUID()
+		args = injectSessionID(args, sessionID)
 	}
 
 	chainPath := filepath.Join(outDir, "chain.jsonl")
@@ -420,12 +429,16 @@ func runRecorded(args []string, outDir string, quiet bool) error {
 	}
 	cmd := exec.Command(args[0], args[1:]...)
 
-	// Tail the transcript in the background while the agent runs in the PTY
-	// (only when we recognize the agent; the cast capture is independent).
+	// Tail the transcript in the background while the agent runs in the PTY.
 	done := make(chan struct{})
 	agentEvents := 0
 	if knowsTranscript {
-		transcript := awaitNewTranscriptAsync(watchDir, before)
+		var transcript <-chan string
+		if sessionID != "" {
+			transcript = awaitTranscriptByID(watchDir, sessionID) // precise
+		} else {
+			transcript = awaitNewTranscriptAsync(watchDir, snapshotJSONL(watchDir)) // fallback heuristic
+		}
 		go func() {
 			t := <-transcript
 			if t != "" {
@@ -617,6 +630,66 @@ func transcriptDirFor(agent string) (string, bool) {
 	}
 	_ = base
 	return "", false
+}
+
+// newUUID returns a random v4 UUID (no external dep) for --session-id.
+func newUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// claudeHasSessionFlag reports whether the user already passed a session flag,
+// so we don't override their explicit --session-id/--resume/--continue.
+func claudeHasSessionFlag(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "--session-id", "--resume", "-r", "--continue", "-c", "--fork-session", "--from-pr":
+			return true
+		}
+		if strings.HasPrefix(a, "--session-id=") || strings.HasPrefix(a, "--resume=") {
+			return true
+		}
+	}
+	return false
+}
+
+// injectSessionID inserts --session-id <uuid> right after the claude binary,
+// before the user's args.
+func injectSessionID(args []string, id string) []string {
+	out := make([]string, 0, len(args)+2)
+	out = append(out, args[0], "--session-id", id)
+	out = append(out, args[1:]...)
+	return out
+}
+
+// awaitTranscriptByID waits for the transcript named <id>.jsonl to appear under
+// watchDir (claude writes <sessionId>.jsonl in the project subdir). Deterministic
+// — no "newest file" guessing.
+func awaitTranscriptByID(watchDir, id string) <-chan string {
+	ch := make(chan string, 1)
+	go func() {
+		deadline := time.Now().Add(15 * time.Second)
+		target := id + ".jsonl"
+		for time.Now().Before(deadline) {
+			var found string
+			filepath.WalkDir(watchDir, func(p string, d os.DirEntry, err error) error {
+				if err == nil && !d.IsDir() && filepath.Base(p) == target {
+					found = p
+				}
+				return nil
+			})
+			if found != "" {
+				ch <- found
+				return
+			}
+			time.Sleep(150 * time.Millisecond)
+		}
+		ch <- "" // not found in time
+	}()
+	return ch
 }
 
 // agentLooksLike reports whether an agent path is the named agent, tolerating
