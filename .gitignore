@@ -9,3 +9,10 @@ chain.pub
 
 # os
 .DS_Store
+session.cast
+flows.jsonl
+*.cast
+*.gif
+*.mp4
+agentprov-sample.jsonl
+agentprov-session.*
