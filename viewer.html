@@ -76,7 +76,15 @@
     background:#1a2030;color:var(--dim);}
   .tool{color:var(--ink);font-weight:600;font-size:13px;}
   .txt{color:var(--dim);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .seq{color:#4a5160;font:10px/1 var(--mono);margin-left:auto;}
+  .meta{color:#4a5160;font:10px/1 var(--mono);margin-left:auto;}
+  .seq{color:#4a5160;font:10px/1 var(--mono);margin-left:10px;}
+  .human{background:rgba(120,160,255,.10);border-left:3px solid #6f8bff;border-radius:0 6px 6px 0;}
+  .human .txt{color:#aebfff;font-weight:600;}
+  .subhead{background:rgba(255,180,80,.12);border-left:3px solid #f0a850;border-radius:0 6px 6px 0;}
+  .subhead .txt{color:#f5c47a;font-weight:600;}
+  .sub{margin-left:26px;border-left:2px solid rgba(240,168,80,.35);}
+  .detail{color:var(--ink);font:12px/1.45 var(--mono);background:rgba(255,255,255,.04);border-left:2px solid var(--dim);margin:6px 0 0;padding:7px 9px;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow:auto;border-radius:0 4px 4px 0;}
+  .t-untrusted .detail{border-left-color:var(--untrusted);}
 
   .t-trusted .marker{background:var(--trusted);}
   .t-untrusted .marker{background:var(--untrusted);}
@@ -132,7 +140,7 @@ async function sha256hex(str){
   return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("");
 }
 function hashInput(prev,n){
-  let s=[n.seq,prev,n.op||"",n.span_id||"",n.parent_span_id||"",n.tool||"",n.trust||"",n.summary||"",n.time||""].join(NUL);
+  let s=[n.seq,prev,n.op||"",n.agent||"",n.span_id||"",n.parent_span_id||"",n.tool||"",n.trust||"",n.summary||"",n.detail||"",n.time||""].join(NUL);
   const a=n.attrs||{}; for(const k of Object.keys(a).sort()) s+=NUL+k+"="+a[k];
   return s;
 }
@@ -155,30 +163,41 @@ async function analyze(nodes){
 }
 
 // classify which nodes are "the story" vs "plumbing"
-const STORY=new Set(["prompt","tool_call","tool_result","assistant"]);
+const STORY=new Set(["prompt","tool_call","tool_result","assistant","subagent"]);
 function isPlumbing(n){ return !STORY.has(n.op) && n.op!=="heartbeat"; }
 
 function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
 function label(n){
-  if(n.op==="prompt") return "prompt to the agent";
-  if(n.op==="assistant") return "agent responded";
+  if(n.op==="prompt") return "🧑 HUMAN → agent";
+  if(n.op==="assistant") return "🤖 agent";
+  if(n.op==="subagent") return "↳ SUBAGENT spawned — "+esc(n.agent||"");
   if(n.op==="tool_result") return "tool output (untrusted — external content enters here)";
   if(n.op==="heartbeat") return esc(n.summary||"recorder heartbeat");
   return esc(n.summary||n.op);
+}
+function shortHash(h){ return h?h.slice(0,10):""; }
+function shortTime(t){
+  if(!t) return "";
+  const m=t.match(/T(\d\d:\d\d:\d\d)/); return m?m[1]:t;
 }
 
 function nodeEl(n,i,broken,why){
   const el=document.createElement("div");
   let cls="node t-"+(n.trust||"unknown");
   if(n.op==="heartbeat")cls+=" heartbeat";
+  if(n.op==="prompt")cls+=" human";
+  if(n.agent&&n.agent!=="main"&&n.op!=="subagent")cls+=" sub";
+  if(n.op==="subagent")cls+=" subhead";
   if(isPlumbing(n))cls+=" plumbing";
   if(broken)cls+=" broken";
   el.className=cls;
   const tool=n.op==="tool_call"&&n.tool?`<span class="tool">${esc(n.tool)}</span>`:"";
   const whyhtml=broken?`<div class="why">⚠ CHAIN BREAKS HERE — ${esc(why)}. Nothing below can be trusted.</div>`:"";
+  const detailhtml=n.detail?`<pre class="detail">${esc(n.detail)}</pre>`:"";
+  const meta=`<span class="meta">${esc(shortTime(n.time))} · ${esc(shortHash(n.hash))}</span>`;
   el.innerHTML=`<div class="rail"><div class="marker"></div></div>
     <div class="body"><div class="line"><span class="op">${esc(n.op||"?")}</span>${tool}
-      <span class="txt">${tool?"":label(n)}</span><span class="seq">#${n.seq}</span></div>${whyhtml}</div>`;
+      <span class="txt">${tool?"":label(n)}</span>${meta}<span class="seq">#${n.seq}</span></div>${detailhtml}${whyhtml}</div>`;
   return el;
 }
 

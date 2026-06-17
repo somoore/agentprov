@@ -39,6 +39,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -92,11 +93,13 @@ func run(args []string) error {
 type Node struct {
 	Seq        int               `json:"seq"`
 	Op         string            `json:"op"` // heartbeat | prompt | tool_call | tool_result | assistant | other
+	Agent      string            `json:"agent,omitempty"` // which agent produced this: "main" or a subagent id
 	SpanID     string            `json:"span_id,omitempty"`
 	ParentSpan string            `json:"parent_span_id,omitempty"`
 	Tool       string            `json:"tool,omitempty"`
 	Trust      string            `json:"trust,omitempty"` // trusted | untrusted | unknown
-	Summary    string            `json:"summary,omitempty"`
+	Summary    string            `json:"summary,omitempty"` // category label (op-derived)
+	Detail     string            `json:"detail,omitempty"`  // the actual content: prompt text, command+args, tool output
 	Time       string            `json:"time,omitempty"`
 	Attrs      map[string]string `json:"attrs,omitempty"`
 	PrevHash   string            `json:"prev_hash"`
@@ -106,8 +109,8 @@ type Node struct {
 
 func contentHash(prev string, n Node) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%d\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s",
-		n.Seq, prev, n.Op, n.SpanID, n.ParentSpan, n.Tool, n.Trust, n.Summary, n.Time)
+	fmt.Fprintf(h, "%d\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s",
+		n.Seq, prev, n.Op, n.Agent, n.SpanID, n.ParentSpan, n.Tool, n.Trust, n.Summary, n.Detail, n.Time)
 	for _, k := range sortedKeys(n.Attrs) {
 		fmt.Fprintf(h, "\x00%s=%s", k, n.Attrs[k])
 	}
@@ -359,7 +362,9 @@ func drainLines(reader *bufio.Reader, buf *strings.Builder, rec *recorder, count
 	}
 }
 
-func recordLine(line string, rec *recorder, count *int) {
+func recordLine(line string, rec *recorder, count *int) { recordLineAs(line, "", rec, count) }
+
+func recordLineAs(line, agent string, rec *recorder, count *int) {
 	if line == "" {
 		return
 	}
@@ -368,12 +373,44 @@ func recordLine(line string, rec *recorder, count *int) {
 		return
 	}
 	for _, n := range normalize(raw) {
+		n.Agent = agent
 		rec.emit(n)
 		*count++
 		if *count%heartbeatEvery == 0 {
 			rec.emit(Node{Op: "heartbeat", Summary: "recorder alive"})
 		}
 	}
+}
+
+// recordFileAs folds one transcript file into rec, tagging every node with agent.
+func recordFileAs(path, agent string, rec *recorder, count *int) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1024*1024), 16*1024*1024)
+	for sc.Scan() {
+		recordLineAs(strings.TrimSpace(sc.Text()), agent, rec, count)
+	}
+	return sc.Err()
+}
+
+// subagentFiles returns the subagent transcript paths for a main transcript at
+// <project>/<sessionId>.jsonl — they live in <project>/<sessionId>/subagents/.
+// Returns nil if there is no such dir (the common single-agent case).
+func subagentFiles(mainPath string) []string {
+	dir := strings.TrimSuffix(mainPath, ".jsonl")
+	matches, _ := filepath.Glob(filepath.Join(dir, "subagents", "agent-*.jsonl"))
+	sort.Strings(matches) // deterministic order
+	return matches
+}
+
+// subagentID derives the short agent id from a subagents/agent-<id>.jsonl path.
+func subagentID(path string) string {
+	base := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	return strings.TrimPrefix(base, "agent-")
 }
 
 // ── record a past transcript ───────────────────────────────────────────────
@@ -396,27 +433,84 @@ func cmdRecord(path string) error {
 		return err
 	}
 	defer out.Close()
+	f.Close() // recordFileAs reopens; we only needed to validate existence above.
 	rec := newRecorder(bufio.NewWriter(out), priv)
 	rec.emit(Node{Op: "heartbeat", Summary: "recorder start", Attrs: map[string]string{"key": keySource}})
 
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1024*1024), 16*1024*1024)
 	count := 0
-	for sc.Scan() {
-		recordLine(strings.TrimSpace(sc.Text()), rec, &count)
-	}
-	if err := sc.Err(); err != nil {
+	if err := recordFileAs(path, "main", rec, &count); err != nil {
 		return err
 	}
+
+	// Fold in any subagents the main session spawned. One signed chain covers
+	// the whole tree: each subagent's nodes are tagged with its id, preceded by
+	// a subagent marker. Tampering ANY node — main or sub — fractures verify.
+	subs := subagentFiles(path)
+	for _, sp := range subs {
+		id := subagentID(sp)
+		rec.emit(Node{Op: "subagent", Agent: id, Summary: "subagent spawned",
+			Attrs: map[string]string{"id": id, "source": filepath.Base(sp)}})
+		if err := recordFileAs(sp, id, rec, &count); err != nil {
+			return err
+		}
+	}
+
 	rec.emit(Node{Op: "heartbeat", Summary: "recorder end (clean exit)"})
 	rec.w.Flush()
-	fmt.Printf("recorded %d nodes (%d agent events) -> chain.jsonl (%s key)\nhead: %s\n",
-		rec.seq, count, keySource, short(rec.prev))
+	subNote := ""
+	if len(subs) > 0 {
+		subNote = fmt.Sprintf(", %d subagent(s)", len(subs))
+	}
+	fmt.Printf("recorded %d nodes (%d agent events%s) -> chain.jsonl (%s key)\nhead: %s\n",
+		rec.seq, count, subNote, keySource, short(rec.prev))
 	return nil
 }
 
 // normalize maps one raw transcript line (Claude OR Codex) to provenance node(s).
 // tool_result is where untrusted content enters (file/web/MCP) — labeled untrusted.
+// truncRunes truncates on a rune boundary so we never split a multi-byte
+// UTF-8 character — a byte slice can, and json.Marshal then re-encodes the
+// broken byte as U+FFFD, making stored JSON differ from what was hashed and
+// breaking verify on messy real transcripts.
+func truncRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
+}
+
+// flatten pulls human-readable text out of whatever a transcript packs into a
+// content/input/output field: a string, a []block with text/content, or a map
+// we JSON-encode. This is the "WHAT happened" — the prompt, the command, the
+// tool output — that the category label alone can't convey.
+func flatten(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case []any:
+		var parts []string
+		for _, e := range x {
+			if s := flatten(e); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, " ")
+	case map[string]any:
+		for _, k := range []string{"text", "content", "command", "output", "stdout"} {
+			if s, ok := x[k]; ok {
+				return flatten(s)
+			}
+		}
+		b, _ := json.Marshal(x)
+		return string(b)
+	default:
+		return ""
+	}
+}
+
+const detailMax = 600
+
 func normalize(raw map[string]any) []Node {
 	if uuid, ok := raw["uuid"].(string); ok { // Claude Code
 		parent, _ := raw["parentUuid"].(string)
@@ -434,10 +528,17 @@ func normalize(raw map[string]any) []Node {
 				n.Op, n.Trust = "tool_call", "trusted"
 				n.Tool, _ = b["name"].(string)
 				n.Summary = "tool_use " + n.Tool
+				n.Detail = truncRunes(flatten(b["input"]), detailMax)
 				nodes = append(nodes, n)
 			case "tool_result":
 				n := base
 				n.Op, n.Trust, n.Summary = "tool_result", "untrusted", "tool_result"
+				n.Detail = truncRunes(flatten(b["content"]), detailMax)
+				nodes = append(nodes, n)
+			case "text":
+				n := base
+				n.Op, n.Trust, n.Summary = "assistant", "trusted", "assistant turn"
+				n.Detail = truncRunes(flatten(b["text"]), detailMax)
 				nodes = append(nodes, n)
 			}
 		}
@@ -446,8 +547,10 @@ func normalize(raw map[string]any) []Node {
 			switch typ {
 			case "user":
 				n.Op, n.Trust, n.Summary = "prompt", "untrusted", "user prompt"
+				n.Detail = truncRunes(flatten(msg["content"]), detailMax)
 			case "assistant":
 				n.Op, n.Trust, n.Summary = "assistant", "trusted", "assistant turn"
+				n.Detail = truncRunes(flatten(msg["content"]), detailMax)
 			default:
 				n.Op, n.Summary = "other", typ
 			}
@@ -471,15 +574,19 @@ func normalize(raw map[string]any) []Node {
 			} else {
 				n.Op, n.Trust, n.Summary = "prompt", "untrusted", "user prompt"
 			}
+			n.Detail = truncRunes(flatten(payload["content"]), detailMax)
 		case "function_call", "custom_tool_call":
 			n.Op, n.Trust = "tool_call", "trusted"
 			n.Tool, _ = payload["name"].(string)
 			n.Summary = "tool_call " + n.Tool
+			n.Detail = truncRunes(flatten(payload["arguments"]), detailMax)
 		case "function_call_output", "custom_tool_call_output", "patch_apply_end":
 			// tool RESULTS are where untrusted content (file/web/MCP) enters.
 			n.Op, n.Trust, n.Summary = "tool_result", "untrusted", "tool_result"
+			n.Detail = truncRunes(flatten(payload["output"]), detailMax)
 		case "agent_message":
 			n.Op, n.Trust, n.Summary = "assistant", "trusted", "assistant message"
+			n.Detail = truncRunes(flatten(payload["message"]), detailMax)
 		}
 		return []Node{n}
 	}
