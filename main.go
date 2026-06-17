@@ -79,10 +79,17 @@ func run(args []string) error {
 		return cmdVerify(args[1])
 	case "view":
 		path := "chain.jsonl"
-		if len(args) > 1 {
-			path = args[1]
+		flowsPath := ""
+		rest := args[1:]
+		for i := 0; i < len(rest); i++ {
+			if rest[i] == "--flows" && i+1 < len(rest) {
+				flowsPath = rest[i+1]
+				i++
+			} else {
+				path = rest[i]
+			}
 		}
-		return cmdView(path)
+		return cmdViewFlows(path, flowsPath)
 	case "tamper":
 		return cmdMutate(args[1], args[2], false)
 	case "drop":

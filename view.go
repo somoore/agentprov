@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -62,7 +63,9 @@ func cmdDemo() error {
 // browser at it. Served (not file://) so the viewer can fetch the chain by URL.
 // The viewer is a pure renderer: it recomputes the same hash chain the CLI does,
 // so what you see in the browser is the real verification.
-func cmdView(chainPath string) error {
+func cmdView(chainPath string) error { return cmdViewFlows(chainPath, "") }
+
+func cmdViewFlows(chainPath, flowsPath string) error {
 	abs, err := filepath.Abs(chainPath)
 	if err != nil {
 		return err
@@ -71,7 +74,26 @@ func cmdView(chainPath string) error {
 		return fmt.Errorf("chain not found: %s (record or run first)", chainPath)
 	}
 
+	// Parse agentsnitch flows if provided (a third, OS-observed evidence layer).
+	var flowsJSON []byte
+	if flowsPath != "" {
+		flows, ferr := loadFlows(flowsPath)
+		if ferr != nil {
+			return fmt.Errorf("reading flows %s: %w", flowsPath, ferr)
+		}
+		flowsJSON, _ = json.Marshal(flows)
+		fmt.Printf("agentprov: overlaying %d agentsnitch network flow(s) from %s\n", len(flows), flowsPath)
+	}
+
 	mux := http.NewServeMux()
+	mux.HandleFunc("/flows", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if flowsJSON == nil {
+			w.Write([]byte("[]"))
+			return
+		}
+		w.Write(flowsJSON)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write(viewerHTML)
