@@ -16,3 +16,6 @@ agentprov-replay-core = { path = "../agentprov-replay-core" }
 agentprov-viewer = { path = "../agentprov-viewer" }
 agentprov-export = { path = "../agentprov-export" }
 agentprov-collectors = { path = "../agentprov-collectors" }
+
+[dev-dependencies]
+sha2 = { workspace = true }

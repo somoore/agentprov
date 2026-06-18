@@ -30,6 +30,103 @@ fn sidecars(apcap: &Path) -> (PathBuf, PathBuf) {
     (PathBuf::from(p), PathBuf::from(s))
 }
 
+/// The authenticity verdict for a capture — the SAME check `verify` runs, so
+/// every surface that displays content (cast/view/export) agrees with `verify`
+/// instead of trusting the keyless chain alone. Without this, a re-forged
+/// capture renders cleanly in the viewer while `verify` rejects it.
+enum Auth {
+    /// Signed tip matches a trusted key (keychain or --pubkey).
+    Valid,
+    /// Signed but no trusted key on hand to check it (off-machine, no pin).
+    Untrusted,
+    /// No signature sidecar at all.
+    Unsigned,
+    /// Signature present but does not match the trusted key — forged/re-signed.
+    Invalid(String),
+}
+
+/// Resolve trust and authenticate the capture's signed tip. `pinned_pub` is the
+/// optional `--pubkey` (responder, out-of-band); otherwise the machine keychain
+/// is the anchor. The bundled `.pub` is never trusted on its own.
+fn authenticate(path: &Path, pinned_pub: Option<Vec<u8>>) -> Auth {
+    let (_, tip) = match read_tip(path) {
+        Ok(t) => t,
+        Err(e) => return Auth::Invalid(e),
+    };
+    let (pub_path, sig_path) = sidecars(path);
+    let sig = match std::fs::read_to_string(&sig_path).ok().and_then(|h| integrity::from_hex(&h)) {
+        Some(s) => s,
+        None => return Auth::Unsigned,
+    };
+    let trusted = match pinned_pub {
+        Some(p) => p,
+        None => match integrity::keychain_public_key() {
+            Some(k) => k.to_vec(),
+            None => return Auth::Untrusted,
+        },
+    };
+    let bundled = std::fs::read_to_string(&pub_path).ok().and_then(|h| integrity::from_hex(&h));
+    if let Some(bp) = &bundled {
+        if bp != &trusted {
+            return Auth::Invalid("bundled key does not match trusted key (re-signed)".into());
+        }
+    }
+    match integrity::verify_tip(&tip, &trusted, &sig) {
+        VerifyTip::Valid => Auth::Valid,
+        VerifyTip::BadSignature => Auth::Invalid("tip does not match trusted key (forged or truncated)".into()),
+        VerifyTip::BadKeyOrSig => Auth::Invalid("malformed key or signature".into()),
+    }
+}
+
+/// Gate a content-displaying surface (cast/export) on authentication. Refuses to
+/// render an INVALID capture outright; refuses UNSIGNED/UNTRUSTED unless the
+/// caller passed `--allow-unsigned` (and then prints a loud warning). This keeps
+/// cast/export honest about what they're showing.
+fn gate_or_exit(path: &Path, pinned_pub: Option<Vec<u8>>, allow_unsigned: bool) {
+    match authenticate(path, pinned_pub) {
+        Auth::Valid => {}
+        Auth::Invalid(why) => {
+            eprintln!("agentprov-rs: REFUSING — capture failed authentication: {why}");
+            process::exit(1);
+        }
+        Auth::Unsigned if allow_unsigned => {
+            eprintln!("agentprov-rs: WARNING — capture is unsigned (consistency only, not authenticated)");
+        }
+        Auth::Untrusted if allow_unsigned => {
+            eprintln!("agentprov-rs: WARNING — capture signed but no trusted key to check it");
+        }
+        Auth::Unsigned | Auth::Untrusted => {
+            eprintln!("agentprov-rs: REFUSING — capture is not authenticated; pass --allow-unsigned to view anyway");
+            process::exit(1);
+        }
+    }
+}
+
+/// Pull `--pubkey <hex>` and `--allow-unsigned` out of a subcommand's args,
+/// returning (pin, allow_unsigned, positional_args).
+fn split_auth_flags(argv: &[String]) -> (Option<Vec<u8>>, bool, Vec<String>) {
+    let mut pin = None;
+    let mut allow = false;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--pubkey" => {
+                i += 1;
+                pin = argv.get(i).and_then(|h| integrity::from_hex(h));
+                if pin.is_none() {
+                    eprintln!("agentprov-rs: --pubkey requires a valid hex key");
+                    process::exit(2);
+                }
+            }
+            "--allow-unsigned" => allow = true,
+            other => rest.push(other.to_string()),
+        }
+        i += 1;
+    }
+    (pin, allow, rest)
+}
+
 // ---------------------------------------------------------------------------
 // Arg parsing
 // ---------------------------------------------------------------------------
@@ -329,13 +426,15 @@ fn cmd_verify(argv: &[String]) {
 // ---------------------------------------------------------------------------
 
 fn cmd_cast(argv: &[String]) {
-    let path = match argv.get(1) {
+    let (pin, allow_unsigned, rest) = split_auth_flags(&argv[1..]);
+    let path = match rest.first() {
         Some(p) => PathBuf::from(p),
         None => {
-            eprintln!("agentprov-rs: cast requires a path argument");
+            eprintln!("agentprov-rs: cast [--pubkey <hex>] [--allow-unsigned] <path>");
             process::exit(2);
         }
     };
+    gate_or_exit(&path, pin, allow_unsigned);
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -358,15 +457,21 @@ fn cmd_cast(argv: &[String]) {
 // ---------------------------------------------------------------------------
 
 fn cmd_view(argv: &[String]) {
-    let path = match argv.get(1) {
+    let (pin, allow_unsigned, rest) = split_auth_flags(&argv[1..]);
+    let path = match rest.first() {
         Some(p) => PathBuf::from(p),
         None => {
-            eprintln!("agentprov-rs: view requires a path argument");
+            eprintln!("agentprov-rs: view [--pubkey <hex>] [--allow-unsigned] <path>");
             process::exit(2);
         }
     };
-    // serve() verifies the chain at startup and serves an error page if it fails;
-    // it prints the loopback URL (with token) to stderr and blocks.
+    // Authenticate the signed tip BEFORE serving. The viewer is the responder's
+    // primary surface — it must agree with `verify`, not just the keyless chain.
+    // A re-forged capture is refused here; serve() then only ever shows an
+    // authenticated (or explicitly --allow-unsigned) capture.
+    gate_or_exit(&path, pin, allow_unsigned);
+    eprintln!("agentprov-rs: capture authenticated — starting viewer");
+    // serve() also re-verifies the chain at startup and prints the loopback URL.
     if let Err(e) = agentprov_viewer::serve(path) {
         eprintln!("agentprov-rs: viewer failed: {e}");
         process::exit(1);
@@ -378,14 +483,16 @@ fn cmd_view(argv: &[String]) {
 // ---------------------------------------------------------------------------
 
 fn cmd_export(argv: &[String]) {
-    // export <gif|mp4> <apcap> <out>
-    let (fmt, apcap, out) = match (argv.get(1), argv.get(2), argv.get(3)) {
+    // export [--pubkey <hex>] [--allow-unsigned] <gif|mp4> <apcap> <out>
+    let (pin, allow_unsigned, rest) = split_auth_flags(&argv[1..]);
+    let (fmt, apcap, out) = match (rest.first(), rest.get(1), rest.get(2)) {
         (Some(f), Some(a), Some(o)) => (f.as_str(), PathBuf::from(a), PathBuf::from(o)),
         _ => {
-            eprintln!("agentprov-rs: export <gif|mp4> <apcap> <out>");
+            eprintln!("agentprov-rs: export [--pubkey <hex>] [--allow-unsigned] <gif|mp4> <apcap> <out>");
             process::exit(2);
         }
     };
+    gate_or_exit(&apcap, pin, allow_unsigned);
     let format = match fmt {
         "gif" => agentprov_export::Format::Gif,
         "mp4" => agentprov_export::Format::Mp4,
@@ -459,14 +566,17 @@ fn usage() {
     eprintln!("      Trust anchor: --pubkey (out-of-band) > machine keychain.");
     eprintln!("      The bundled .pub is never trusted on its own.");
     eprintln!();
-    eprintln!("  agentprov-rs cast <path>");
-    eprintln!("      Convert a (verified) APCAP to asciicast v2 on stdout.");
+    eprintln!("  agentprov-rs cast [--pubkey <hex>] [--allow-unsigned] <path>");
+    eprintln!("      Convert an authenticated APCAP to asciicast v2 on stdout.");
     eprintln!();
-    eprintln!("  agentprov-rs view <path>");
-    eprintln!("      Serve the capture in a hardened loopback viewer (prints the URL).");
+    eprintln!("  agentprov-rs view [--pubkey <hex>] [--allow-unsigned] <path>");
+    eprintln!("      Serve an authenticated capture in a hardened loopback viewer.");
     eprintln!();
-    eprintln!("  agentprov-rs export <gif|mp4> <apcap> <out>");
-    eprintln!("      Render the capture to gif/mp4 (needs agg, and ffmpeg for mp4).");
+    eprintln!("  agentprov-rs export [--pubkey <hex>] [--allow-unsigned] <gif|mp4> <apcap> <out>");
+    eprintln!("      Render an authenticated capture to gif/mp4 (needs agg/ffmpeg).");
+    eprintln!();
+    eprintln!("      cast/view/export refuse a forged or unauthenticated capture;");
+    eprintln!("      --allow-unsigned downgrades unsigned/untrusted to a warning.");
     eprintln!();
     eprintln!("  agentprov-rs flows <events.jsonl> [out-dir]");
     eprintln!("      Normalize agentsnitch network events into a flow overlay.");
@@ -556,5 +666,54 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(parse_run_args(&argv).is_err());
+    }
+
+    /// Regression: cast/view/export gate on `authenticate`, which must REFUSE a
+    /// re-forged capture (the milestone-2 hole, one layer out). An honest signed
+    /// capture authenticates against the pinned key; a re-forged + re-signed one
+    /// is rejected because the bundled key no longer matches the trusted key.
+    #[test]
+    fn authenticate_refuses_reforged_capture() {
+        use agentprov_capture_format::{FrameType, Writer};
+        use agentprov_integrity::Signing;
+
+        let dir = std::env::temp_dir().join(format!("apcap-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let honest = dir.join("honest.apcap");
+
+        // Build + sign an honest capture with the "real recorder" key.
+        let recorder = Signing::from_seed([1u8; 32]);
+        let mut tip = [0u8; 32];
+        {
+            let f = std::fs::File::create(&honest).unwrap();
+            let mut w = Writer::new(f);
+            w.write(FrameType::SessionStart, 0, 0, b"claude").unwrap();
+            w.write(FrameType::PtyOutput, 1, 1, b"real").unwrap();
+            w.write(FrameType::SessionEnd, 2, 2, b"exit=0").unwrap();
+        }
+        verify(BufReader::new(std::fs::File::open(&honest).unwrap()), |fr| tip = fr.frame_hash).unwrap();
+        let (pp, sp) = sidecars(&honest);
+        std::fs::write(&pp, integrity::to_hex(&recorder.public_key())).unwrap();
+        std::fs::write(&sp, integrity::to_hex(&recorder.sign_tip(&tip))).unwrap();
+
+        let recorder_pub = recorder.public_key().to_vec();
+        // Honest capture authenticates against the recorder's pinned key.
+        assert!(matches!(authenticate(&honest, Some(recorder_pub.clone())), Auth::Valid));
+
+        // Attacker re-forges: same bytes but re-signs with their OWN key and
+        // overwrites the bundled sidecars.
+        let forged = dir.join("forged.apcap");
+        std::fs::copy(&honest, &forged).unwrap();
+        let attacker = Signing::from_seed([9u8; 32]);
+        let mut ftip = [0u8; 32];
+        verify(BufReader::new(std::fs::File::open(&forged).unwrap()), |fr| ftip = fr.frame_hash).unwrap();
+        let (fpp, fsp) = sidecars(&forged);
+        std::fs::write(&fpp, integrity::to_hex(&attacker.public_key())).unwrap();
+        std::fs::write(&fsp, integrity::to_hex(&attacker.sign_tip(&ftip))).unwrap();
+
+        // Against the trusted recorder key, the re-signed forgery is rejected.
+        assert!(matches!(authenticate(&forged, Some(recorder_pub)), Auth::Invalid(_)));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

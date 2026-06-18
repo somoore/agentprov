@@ -272,6 +272,8 @@ impl EvidenceSink for LocalDirectorySink {
     }
 
     fn finalize(&mut self) -> std::io::Result<()> {
+        // Ensure the target dir exists — the caller may point at a fresh path.
+        std::fs::create_dir_all(&self.dir)?;
         // Write flows.jsonl — one Flow per line, matching JSONL convention.
         let jsonl_path = self.dir.join("flows.jsonl");
         let mut f = std::fs::File::create(&jsonl_path)?;
