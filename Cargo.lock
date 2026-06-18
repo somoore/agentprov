@@ -67,6 +67,7 @@ name = "agentprov-pty-core"
 version = "0.1.0"
 dependencies = [
  "agentprov-capture-format",
+ "agentprov-integrity",
  "libc",
  "rustix 0.38.44",
 ]
