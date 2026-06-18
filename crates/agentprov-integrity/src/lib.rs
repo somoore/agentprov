@@ -9,10 +9,14 @@
 //! truncates any frame produces a tip the signature no longer matches.
 //!
 //! Key handling mirrors the Go recorder: the ed25519 seed lives in the macOS
-//! keychain (via the `security` CLI, so the agent never sees it). If the
-//! keychain is unavailable we fall back to an ephemeral key and say so — the
-//! capture is still chained, just not non-repudiable. Honest degradation, never
-//! silent.
+//! keychain (via the `security` CLI). NOTE — this raises the bar but is not an
+//! airtight boundary: the keychain ACL trusts `/usr/bin/security`, so any
+//! same-user process (including the captured agent, which can shell out) can
+//! read the seed without a prompt. It defends against off-machine attackers and
+//! casual tampering, not a same-user adversary with code execution. A hardware
+//! key or a separate-uid signing daemon would close that gap (future work).
+//! If the keychain is unavailable we fall back to an ephemeral key and say so —
+//! still chained, just not non-repudiable. Honest degradation, never silent.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
@@ -65,6 +69,15 @@ impl Signing {
     pub fn sign_tip(&self, tip: &[u8; 32]) -> [u8; SIG_LEN] {
         self.key.sign(tip).to_bytes()
     }
+}
+
+/// The verifying (public) key bound in this machine's keychain, if present.
+/// This is the *trusted anchor* for on-machine verification — it does NOT come
+/// from the capture bundle, so an attacker who rewrites the bundled `.pub`
+/// cannot fool a local verify.
+pub fn keychain_public_key() -> Option<[u8; PUB_LEN]> {
+    let seed = keychain::get_seed()?;
+    Some(SigningKey::from_bytes(&seed).verifying_key().to_bytes())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -182,6 +195,32 @@ mod tests {
         let tip = [9u8; 32];
         let sig = signer.sign_tip(&tip);
         assert_eq!(verify_tip(&tip, &other.public_key(), &sig), VerifyTip::BadSignature);
+    }
+
+    #[test]
+    fn resign_attack_rejected_when_pinned_to_trusted_key() {
+        // THE attack the thesis is about: an attacker re-forges the chain AND
+        // re-signs the forged tip with their OWN fresh key, overwriting the
+        // bundled .pub/.sig. Verifying against the *bundled* key would say VALID
+        // (their key signs their tip). Verifying against the TRUSTED key (the
+        // real recorder's, pinned out-of-band / from keychain) catches it.
+        let trusted = Signing::from_seed([100u8; 32]); // the real recorder
+        let attacker = Signing::from_seed([200u8; 32]); // fresh attacker key
+        let forged_tip = [0xabu8; 32];
+        let attacker_sig = attacker.sign_tip(&forged_tip);
+
+        // Against the bundled (attacker) key, the forgery "verifies" — the hole.
+        assert_eq!(
+            verify_tip(&forged_tip, &attacker.public_key(), &attacker_sig),
+            VerifyTip::Valid,
+            "bundled-key verify is fooled — this is why we must pin"
+        );
+        // Against the trusted key, it's rejected. This is the fix.
+        assert_eq!(
+            verify_tip(&forged_tip, &trusted.public_key(), &attacker_sig),
+            VerifyTip::BadSignature,
+            "pinned-key verify rejects the re-signed forgery"
+        );
     }
 
     #[test]

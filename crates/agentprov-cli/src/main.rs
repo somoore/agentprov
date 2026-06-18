@@ -156,9 +156,35 @@ fn cmd_run(argv: &[String]) {
 // ---------------------------------------------------------------------------
 
 fn cmd_verify(argv: &[String]) {
-    // argv = ["verify", <path>]
-    let path = match argv.get(1) {
-        Some(p) => PathBuf::from(p),
+    // argv = ["verify", [--pubkey <hex>], <path>]
+    // --pubkey pins the trusted signing key for off-machine (responder) verify,
+    // obtained out-of-band. Without it, on-machine verify falls back to the
+    // keychain key. The bundled .pub is NEVER trusted on its own.
+    let mut pinned_pub: Option<Vec<u8>> = None;
+    let mut path: Option<PathBuf> = None;
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--pubkey" => {
+                i += 1;
+                match argv.get(i).and_then(|h| integrity::from_hex(h)) {
+                    Some(b) => pinned_pub = Some(b),
+                    None => {
+                        eprintln!("agentprov-rs: --pubkey requires a valid hex key");
+                        process::exit(2);
+                    }
+                }
+            }
+            other if other.starts_with("--") => {
+                eprintln!("agentprov-rs: verify: unknown flag `{other}`");
+                process::exit(2);
+            }
+            p => path = Some(PathBuf::from(p)),
+        }
+        i += 1;
+    }
+    let path = match path {
+        Some(p) => p,
         None => {
             eprintln!("agentprov-rs: verify requires a path argument");
             usage();
@@ -231,42 +257,67 @@ fn cmd_verify(argv: &[String]) {
                 println!("SessionEnd:   (none)");
             }
 
-            // Signature check: the chain alone is keyless (consistency only).
-            // The signed tip is what catches an adversary who re-forges the
-            // chain or truncates trailing frames. Absence of sidecars is
-            // reported as UNSIGNED, not as a pass — fail-loud on the weaker case.
+            // Signature check. The chain alone is keyless (consistency only);
+            // the signed tip catches re-forging and truncation. CRITICAL: the
+            // trust anchor is NOT the bundled .pub — an attacker writes that
+            // file. We verify against a TRUSTED key: the --pubkey pin (responder,
+            // out-of-band) or this machine's keychain key. The bundled .pub alone
+            // is never enough to say VALID.
             println!();
             let (pub_path, sig_path) = sidecars(&path);
-            match (std::fs::read_to_string(&pub_path), std::fs::read_to_string(&sig_path)) {
-                (Ok(pub_hex), Ok(sig_hex)) => {
-                    let pk = integrity::from_hex(&pub_hex);
-                    let sg = integrity::from_hex(&sig_hex);
-                    match (pk, sg) {
-                        (Some(pk), Some(sg)) => match integrity::verify_tip(&tip, &pk, &sg) {
-                            VerifyTip::Valid => {
-                                println!("SIGNATURE: VALID — tip signed, chain is tamper-evident");
-                                process::exit(0);
-                            }
-                            VerifyTip::BadSignature => {
-                                eprintln!("SIGNATURE: INVALID — tip does not match signature (forged or truncated)");
-                                process::exit(1);
-                            }
-                            VerifyTip::BadKeyOrSig => {
-                                eprintln!("SIGNATURE: malformed key/signature sidecar");
-                                process::exit(1);
-                            }
-                        },
-                        _ => {
-                            eprintln!("SIGNATURE: malformed hex in sidecar");
-                            process::exit(1);
-                        }
-                    }
-                }
-                _ => {
-                    // No sidecars: chain verified but unsigned. Exit 0 (the chain
-                    // IS consistent) but say plainly it isn't tamper-evident.
-                    println!("SIGNATURE: UNSIGNED — chain is consistent but not authenticated (no .pub/.sig)");
+            let bundled_pub = std::fs::read_to_string(&pub_path).ok().and_then(|h| integrity::from_hex(&h));
+            let sig = std::fs::read_to_string(&sig_path).ok().and_then(|h| integrity::from_hex(&h));
+
+            let sig = match sig {
+                Some(s) => s,
+                None => {
+                    println!("SIGNATURE: UNSIGNED — chain is consistent but not authenticated (no .sig)");
                     process::exit(0);
+                }
+            };
+
+            // Resolve the trusted key, in priority order.
+            let (trusted_pub, anchor) = match pinned_pub {
+                Some(p) => (Some(p), "pinned --pubkey"),
+                None => match integrity::keychain_public_key() {
+                    Some(k) => (Some(k.to_vec()), "machine keychain"),
+                    None => (None, ""),
+                },
+            };
+
+            let trusted_pub = match trusted_pub {
+                None => {
+                    // No trusted anchor available: we cannot authenticate. Report
+                    // UNTRUSTED — never VALID off a bundled key alone.
+                    println!("SIGNATURE: UNTRUSTED — capture is signed but no trusted key to check it");
+                    println!("  pass --pubkey <hex> (obtained out-of-band) to authenticate off-machine");
+                    process::exit(0);
+                }
+                Some(k) => k,
+            };
+
+            // If a .pub is bundled, it must match the trusted key — a mismatch
+            // means the capture was signed by someone other than the trusted
+            // recorder (the re-sign attack).
+            if let Some(bp) = &bundled_pub {
+                if bp != &trusted_pub {
+                    eprintln!("SIGNATURE: INVALID — bundled key does not match trusted {anchor} (re-signed by another key)");
+                    process::exit(1);
+                }
+            }
+
+            match integrity::verify_tip(&tip, &trusted_pub, &sig) {
+                VerifyTip::Valid => {
+                    println!("SIGNATURE: VALID — tip signed by trusted {anchor}; chain is tamper-evident");
+                    process::exit(0);
+                }
+                VerifyTip::BadSignature => {
+                    eprintln!("SIGNATURE: INVALID — tip does not match trusted {anchor} (forged, truncated, or re-signed)");
+                    process::exit(1);
+                }
+                VerifyTip::BadKeyOrSig => {
+                    eprintln!("SIGNATURE: malformed key or signature");
+                    process::exit(1);
                 }
             }
         }
@@ -284,8 +335,10 @@ fn usage() {
     eprintln!("      Default --out is session.apcap in the current directory.");
     eprintln!("      Exits with the child's exit code.");
     eprintln!();
-    eprintln!("  agentprov-rs verify <path>");
-    eprintln!("      Verify the APCAP file's hash chain and print a report.");
+    eprintln!("  agentprov-rs verify [--pubkey <hex>] <path>");
+    eprintln!("      Verify the APCAP hash chain and the signed tip.");
+    eprintln!("      Trust anchor: --pubkey (out-of-band) > machine keychain.");
+    eprintln!("      The bundled .pub is never trusted on its own.");
     eprintln!();
     eprintln!("  agentprov-rs help");
     eprintln!("      Show this message.");
