@@ -472,23 +472,22 @@ fn cmd_view(argv: &[String]) {
     let path = match rest.first() {
         Some(p) => PathBuf::from(p),
         None => match install::latest_apcap() {
-            Some(p) => { eprintln!("agentprov-rs: viewing latest session: {}", p.display()); p }
+            Some(p) => p,
             None => {
-                eprintln!("agentprov-rs: view [--pubkey <hex>] [--allow-unsigned] [<path>]");
+                eprintln!("agentprov: view [--pubkey <hex>] [--allow-unsigned] [<path>]");
                 eprintln!("  (no path given and no recorded sessions found)");
                 process::exit(2);
             }
         },
     };
-    // Authenticate the signed tip BEFORE serving. The viewer is the responder's
-    // primary surface — it must agree with `verify`, not just the keyless chain.
-    // A re-forged capture is refused here; serve() then only ever shows an
-    // authenticated (or explicitly --allow-unsigned) capture.
+    // Authenticate the signed tip BEFORE serving — the viewer must agree with
+    // `verify`, not just the keyless chain. A re-forged capture is refused here.
     gate_or_exit(&path, pin, allow_unsigned);
-    eprintln!("agentprov-rs: capture authenticated — starting viewer");
-    // serve() also re-verifies the chain at startup and prints the loopback URL.
-    if let Err(e) = agentprov_viewer::serve(path) {
-        eprintln!("agentprov-rs: viewer failed: {e}");
+    // serve() binds, prints the URL, and blocks. We open the browser to that URL
+    // a moment after it binds so the user doesn't copy/paste (and risk grabbing a
+    // stale viewer's URL). serve() owns the URL print; we add nothing else.
+    if let Err(e) = agentprov_viewer::serve_and_open(path) {
+        eprintln!("agentprov: viewer failed: {e}");
         process::exit(1);
     }
 }

@@ -460,6 +460,16 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) {
 /// If the APCAP fails verification, still binds and serves an error page —
 /// the URL is printed so the caller can open it and see the failure reason.
 pub fn serve(apcap_path: PathBuf) -> io::Result<()> {
+    serve_inner(apcap_path, false)
+}
+
+/// Like [`serve`], but also opens the system browser at the viewer URL so the
+/// user doesn't copy/paste (and risk pasting a stale viewer's URL → 403).
+pub fn serve_and_open(apcap_path: PathBuf) -> io::Result<()> {
+    serve_inner(apcap_path, true)
+}
+
+fn serve_inner(apcap_path: PathBuf, open_browser: bool) -> io::Result<()> {
     let state = ServerState::new(&apcap_path)?;
     let state = Arc::new(state);
 
@@ -468,9 +478,12 @@ pub fn serve(apcap_path: PathBuf) -> io::Result<()> {
     let port = listener.local_addr()?.port();
     let url = build_url(port, &state.token);
 
-    eprintln!("agentprov viewer: {url}");
+    println!("agentprov viewer: {url}");
     if state.cast_bytes.is_none() {
-        eprintln!("agentprov viewer: WARNING — capture did not verify; error page will be shown");
+        println!("agentprov viewer: WARNING — capture did not verify; error page will be shown");
+    }
+    if open_browser {
+        open_in_browser(&url);
     }
 
     for stream in listener.incoming() {
@@ -482,12 +495,33 @@ pub fn serve(apcap_path: PathBuf) -> io::Result<()> {
     Ok(())
 }
 
+/// Open `url` in the default browser, best-effort. `open` on macOS, `xdg-open`
+/// on Linux. Failure is silent — the URL is already printed for manual use.
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(target_os = "macos"))]
+    let opener = "xdg-open";
+    let _ = std::process::Command::new(opener).arg(url).spawn();
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use agentprov_capture_format::{FrameType, Writer};
+
+    /// Regression: the URL the viewer PRINTS must route to Index, not Forbidden.
+    /// (Reproduces the "paste the URL → 403" report.)
+    #[test]
+    fn printed_url_routes_to_index_not_403() {
+        let token = gen_token();
+        let url = build_url(12345, &token);
+        // what the browser sends as the request target: path + query
+        let target = &url[url.find("/?").expect("url has /?")..];
+        assert_eq!(route(target, &token), Route::Index, "url={url} target={target}");
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
