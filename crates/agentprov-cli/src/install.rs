@@ -180,6 +180,19 @@ fn session_id() -> String {
     format!("{nanos}-{}", std::process::id())
 }
 
+/// Newest recorded session's `session.apcap`, if any. Lets `view`/`verify`/`cast`
+/// default to "the session I just recorded" with no path argument.
+pub fn latest_apcap() -> Option<PathBuf> {
+    let rd = std::fs::read_dir(sessions_root()).ok()?;
+    let mut dirs: Vec<_> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("session.apcap").exists())
+        .collect();
+    dirs.sort();
+    dirs.pop().map(|d| d.join("session.apcap"))
+}
+
 /// List recorded sessions, newest first.
 pub fn list_sessions() {
     let root = sessions_root();

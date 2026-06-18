@@ -54,8 +54,30 @@ impl From<io::Error> for ReplayError {
 
 /// Write the asciicast v2 header line: `{"version":2,"width":W,"height":H}`.
 /// No serde — compact, no extra keys the player doesn't need.
-fn write_header<W: Write>(out: &mut W, width: u16, height: u16) -> io::Result<()> {
-    writeln!(out, "{{\"version\":2,\"width\":{width},\"height\":{height}}}")
+fn write_header<W: Write>(out: &mut W, c: &Collected) -> io::Result<()> {
+    // Superset of the Go cast header: version/width/height always; timestamp and
+    // env (TERM/SHELL) when the capture recorded them (older captures omit them,
+    // and we omit the keys rather than emit empty ones).
+    write!(out, "{{\"version\":2,\"width\":{},\"height\":{}", c.width, c.height)?;
+    if c.epoch > 0 {
+        write!(out, ",\"timestamp\":{}", c.epoch)?;
+    }
+    let term = escape_json_string(c.term.as_bytes());
+    let shell = escape_json_string(c.shell.as_bytes());
+    if !c.term.is_empty() || !c.shell.is_empty() {
+        write!(out, ",\"env\":{{")?;
+        let mut first = true;
+        if !c.shell.is_empty() {
+            write!(out, "\"SHELL\":\"{shell}\"")?;
+            first = false;
+        }
+        if !c.term.is_empty() {
+            if !first { write!(out, ",")?; }
+            write!(out, "\"TERM\":\"{term}\"")?;
+        }
+        write!(out, "}}")?;
+    }
+    writeln!(out, "}}")
 }
 
 // ── JSON string escaping ────────────────────────────────────────────────────────
@@ -114,6 +136,12 @@ struct Collected {
     saw_resize: bool,
     /// SessionStart payload as UTF-8 command string.
     command: String,
+    /// TERM from the SessionStart metadata (empty if not recorded).
+    term: String,
+    /// SHELL from the SessionStart metadata (empty if not recorded).
+    shell: String,
+    /// Absolute wall-clock epoch seconds of capture start (0 if not recorded).
+    epoch: u64,
     /// SessionEnd payload as UTF-8 exit string.
     exit: String,
     /// Total PtyOutput payload bytes.
@@ -134,6 +162,9 @@ impl Collected {
             height: 24,
             saw_resize: false,
             command: String::new(),
+            term: String::new(),
+            shell: String::new(),
+            epoch: 0,
             exit: String::new(),
             output_bytes: 0,
             tip_hash: [0u8; 32],
@@ -152,7 +183,23 @@ impl Collected {
 
         match f.frame_type {
             FrameType::SessionStart => {
-                self.command = String::from_utf8_lossy(&f.payload).into_owned();
+                // Payload is `key=value` lines (cmd/term/shell/epoch). Older
+                // captures stored just the bare command — fall back to that.
+                let raw = String::from_utf8_lossy(&f.payload);
+                if raw.contains('=') {
+                    for line in raw.lines() {
+                        let Some((k, v)) = line.split_once('=') else { continue };
+                        match k {
+                            "cmd" => self.command = v.to_string(),
+                            "term" => self.term = v.to_string(),
+                            "shell" => self.shell = v.to_string(),
+                            "epoch" => self.epoch = v.parse().unwrap_or(0),
+                            _ => {}
+                        }
+                    }
+                } else {
+                    self.command = raw.into_owned();
+                }
             }
             FrameType::SessionEnd => {
                 self.exit = String::from_utf8_lossy(&f.payload).into_owned();
@@ -206,7 +253,7 @@ pub fn to_asciicast<R: Read, W: Write>(apcap: R, mut out: W) -> Result<u64, Repl
     let mut c = Collected::new();
     verify(apcap, |f| c.ingest(f))?;
 
-    write_header(&mut out, c.width, c.height)?;
+    write_header(&mut out, &c)?;
     let n = c.events.len() as u64;
     for (_, line) in &c.events {
         out.write_all(line.as_bytes())?;
@@ -266,7 +313,7 @@ pub fn to_asciicast_range<R: Read, W: Write>(
     let mut c = Collected::new();
     verify(apcap, |f| c.ingest(f))?;
 
-    write_header(&mut out, c.width, c.height)?;
+    write_header(&mut out, &c)?;
     let mut emitted = 0u64;
     for (mono_ns, line) in &c.events {
         if *mono_ns >= start_ns && *mono_ns < end_ns {

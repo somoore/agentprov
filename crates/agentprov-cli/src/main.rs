@@ -284,11 +284,10 @@ fn cmd_verify(argv: &[String]) {
         }
         i += 1;
     }
-    let path = match path {
+    let path = match path.or_else(install::latest_apcap) {
         Some(p) => p,
         None => {
-            eprintln!("agentprov-rs: verify requires a path argument");
-            usage();
+            eprintln!("agentprov-rs: verify [--pubkey <hex>] [<path>] (no sessions recorded yet)");
             process::exit(2);
         }
     };
@@ -433,10 +432,13 @@ fn cmd_cast(argv: &[String]) {
     let (pin, allow_unsigned, rest) = split_auth_flags(&argv[1..]);
     let path = match rest.first() {
         Some(p) => PathBuf::from(p),
-        None => {
-            eprintln!("agentprov-rs: cast [--pubkey <hex>] [--allow-unsigned] <path>");
-            process::exit(2);
-        }
+        None => match install::latest_apcap() {
+            Some(p) => p,
+            None => {
+                eprintln!("agentprov-rs: cast [--pubkey <hex>] [--allow-unsigned] [<path>]");
+                process::exit(2);
+            }
+        },
     };
     gate_or_exit(&path, pin, allow_unsigned);
     let file = match std::fs::File::open(&path) {
@@ -464,10 +466,14 @@ fn cmd_view(argv: &[String]) {
     let (pin, allow_unsigned, rest) = split_auth_flags(&argv[1..]);
     let path = match rest.first() {
         Some(p) => PathBuf::from(p),
-        None => {
-            eprintln!("agentprov-rs: view [--pubkey <hex>] [--allow-unsigned] <path>");
-            process::exit(2);
-        }
+        None => match install::latest_apcap() {
+            Some(p) => { eprintln!("agentprov-rs: viewing latest session: {}", p.display()); p }
+            None => {
+                eprintln!("agentprov-rs: view [--pubkey <hex>] [--allow-unsigned] [<path>]");
+                eprintln!("  (no path given and no recorded sessions found)");
+                process::exit(2);
+            }
+        },
     };
     // Authenticate the signed tip BEFORE serving. The viewer is the responder's
     // primary surface — it must agree with `verify`, not just the keyless chain.

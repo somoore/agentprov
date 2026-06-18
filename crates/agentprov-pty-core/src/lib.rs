@@ -94,11 +94,27 @@ impl CaptureSession {
         // ── prepare argv strings before fork (no allocation in child) ────────
         let cmd_cstr = std::ffi::CString::new(self.command.as_os_str().as_encoded_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let basename_bytes: Vec<u8> = self
+        let basename: String = self
             .command
             .file_name()
-            .map(|n| n.as_encoded_bytes().to_vec())
-            .unwrap_or_else(|| b"unknown".to_vec());
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".into());
+        // SessionStart payload carries the session metadata the replay header
+        // needs (a true superset of the Go cast): cmd, TERM, SHELL, and the
+        // absolute wall-clock epoch (frame wall_ns is relative to capture start,
+        // so we stamp the real start time here). key=value lines, opaque to the
+        // frozen format. Newlines/`=` don't appear in these values in practice;
+        // the parser is tolerant if they do (splits on first `=`).
+        let epoch = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let term = std::env::var("TERM").unwrap_or_default();
+        let shell = std::env::var("SHELL").unwrap_or_default();
+        let start_meta = format!(
+            "cmd={basename}\nterm={term}\nshell={shell}\nepoch={epoch}\n"
+        );
+        let basename_bytes = start_meta.into_bytes();
         let mut arg_cstrings: Vec<std::ffi::CString> = Vec::with_capacity(self.args.len() + 1);
         arg_cstrings.push(cmd_cstr.clone());
         for a in &self.args {
@@ -439,7 +455,10 @@ mod tests {
 
         // First frame is SessionStart.
         assert_eq!(frames[0].0, FT::SessionStart, "first frame must be SessionStart");
-        assert_eq!(&frames[0].1, b"sh", "SessionStart payload should be the command basename");
+        // SessionStart payload is `key=value` metadata; it carries the command.
+        let start = String::from_utf8_lossy(&frames[0].1);
+        assert!(start.contains("cmd=sh"), "SessionStart should carry cmd=sh, got {start:?}");
+        assert!(start.contains("epoch="), "SessionStart should carry an epoch");
 
         // Last frame is SessionEnd.
         let last = frames.last().expect("must have frames");
