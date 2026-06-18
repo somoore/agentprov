@@ -21,8 +21,27 @@
 //! frame_hash   : [u8; 32]  sha256(everything above, prev_hash included)
 //! ```
 //!
-//! `frame_hash` chains into the next frame's `prev_hash`, giving append-only
-//! tamper evidence: altering any byte of any frame breaks every frame after it.
+//! `frame_hash` chains into the next frame's `prev_hash`, giving an append-only
+//! integrity chain: altering any byte of any frame breaks every frame after it.
+//!
+//! # Threat model — read before trusting this
+//!
+//! This is a *keyless* hash chain. It detects **accidental corruption and naive
+//! edits**, not a motivated adversary. There is no secret in the format, so
+//! anyone with write access to the file (including the agent we claim to
+//! distrust) can edit a frame, recompute its `payload_hash`/`frame_hash`, and
+//! re-forge every downstream `prev_hash` — and [`verify`] will pass. Real
+//! tamper-*evidence* requires signing the tip `frame_hash` with a key the
+//! editor does not hold (ed25519, as the Go chain does). That signature lives
+//! *outside* this frame stream (a `.sig`/manifest over the final hash), so it
+//! can be added later without changing this frozen layout.
+//!
+//! Two consequences until the signed tip exists:
+//!   1. The chain proves *consistency*, not *authenticity*.
+//!   2. End-truncation is undetectable: chopping the last N frames leaves a
+//!      valid prefix that still verifies (this is by design for crash
+//!      resilience — a crash mid-capture must leave a verifiable file — so it
+//!      can only be closed by anchoring the signed tip, not by the format).
 
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
@@ -288,13 +307,45 @@ mod tests {
     }
 
     #[test]
-    fn tamper_breaks_chain() {
+    fn naive_edit_breaks_chain() {
         let mut buf = sample();
-        // flip a payload byte in the second frame; chain must catch it.
+        // flip a payload byte without recomputing hashes; chain must catch it.
         let i = buf.iter().position(|&b| b == b'h').unwrap();
         buf[i] ^= 0xff;
         let err = verify(&buf[..], |_| {}).unwrap_err();
         assert!(matches!(err, VerifyError::PayloadHashMismatch(_) | VerifyError::ChainBreak { .. }));
+    }
+
+    #[test]
+    fn re_forged_chain_passes_documenting_the_limit() {
+        // An adversary who edits a frame AND re-runs the writer produces a file
+        // that verifies. This is the keyless-chain limitation, not a bug — it's
+        // why the tip must be signed. This test pins that reality so nobody
+        // mistakes `verify` passing for authenticity.
+        let mut buf = Vec::new();
+        let mut w = Writer::new(&mut buf);
+        w.write(FrameType::SessionStart, 0, 0, b"claude").unwrap();
+        w.write(FrameType::PtyOutput, 100, 100, b"EVIL OUTPUT").unwrap();
+        w.write(FrameType::SessionEnd, 300, 300, b"exit=0").unwrap();
+        assert_eq!(verify(&buf[..], |_| {}).unwrap(), 3); // forgery verifies
+    }
+
+    #[test]
+    fn end_truncation_is_silently_accepted() {
+        // Dropping whole trailing frames leaves a valid prefix (by design for
+        // crash resilience). Documented limitation — closed only by a signed tip.
+        let buf = sample();
+        // Find the byte offset of the end of frame 0 by re-verifying with a stop.
+        let mut frame0_end = 0usize;
+        verify(&buf[..], |f| {
+            if f.seq == 0 {
+                // header(34) + payload(6 "claude") + 96 tail
+                frame0_end = 34 + f.payload.len() + 96;
+            }
+        })
+        .unwrap();
+        // Truncate to just frame 0 — still verifies as a 1-frame file.
+        assert_eq!(verify(&buf[..frame0_end], |_| {}).unwrap(), 1);
     }
 
     #[test]

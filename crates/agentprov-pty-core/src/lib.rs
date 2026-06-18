@@ -154,6 +154,12 @@ impl CaptureSession {
         //     ioctl, dup2, execvp, _exit) after fork.
         //   - The child's copy of master fd is closed immediately in the child,
         //     so there is no double-close with the parent's OwnedFd Drop.
+        // ASSUMPTION (load-bearing): the process is single-threaded at this
+        //   point. fork() in a multithreaded process duplicates only the calling
+        //   thread, leaving locks (incl. the allocator's) possibly held by a
+        //   dead thread — making the post-fork code UB if it allocates. The CLI
+        //   is single-threaded; if a future caller spawns threads before run(),
+        //   this child path must be revisited (posix_spawn or a pre-forked helper).
         let child_pid = unsafe { libc::fork() };
         if child_pid < 0 {
             return Err(io::Error::last_os_error());
