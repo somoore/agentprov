@@ -647,6 +647,9 @@ pub fn record_transcript_with_cast(
     let _probe = File::open(transcript_path)?;
     drop(_probe);
 
+    // Ensure the output dir exists (the shim points at a fresh session dir).
+    std::fs::create_dir_all(out_dir)?;
+
     let signer = Signing::load_or_create();
     let key_source = match signer.source {
         agentprov_integrity::KeySource::Keychain => "keychain",
