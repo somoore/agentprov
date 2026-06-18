@@ -20,6 +20,7 @@ dependencies = [
  "agentprov-pty-core",
  "agentprov-replay-core",
  "agentprov-viewer",
+ "sha2",
 ]
 
 [[package]]
