@@ -350,14 +350,24 @@ impl CaptureSession {
         };
 
         // ── write SessionEnd ─────────────────────────────────────────────────
+        // CRITICAL for fail-open: the child has already run and exited by now.
+        // run() must NOT return Err past this point — a caller's fallback would
+        // otherwise re-exec claude (double run). A failed final-frame write only
+        // costs a slightly-truncated capture; we keep the real exit code and
+        // return Ok. Every Err run() can return is PRE-fork (PTY setup), so the
+        // shim can safely treat Err as "capture never started, run claude raw".
         let end_payload = format!("exit={exit_code}");
-        writer.write(
-            FrameType::SessionEnd,
-            mono_ns(Instant::now()),
-            wall_ns(SystemTime::now()),
-            end_payload.as_bytes(),
-        )?;
-        frames_written += 1;
+        if writer
+            .write(
+                FrameType::SessionEnd,
+                mono_ns(Instant::now()),
+                wall_ns(SystemTime::now()),
+                end_payload.as_bytes(),
+            )
+            .is_ok()
+        {
+            frames_written += 1;
+        }
 
         Ok(CaptureResult { exit_code, frames_written })
     }

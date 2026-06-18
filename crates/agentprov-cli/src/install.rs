@@ -62,11 +62,18 @@ fn shell_quote(s: &str) -> String {
 fn shim_script(agentprov: &Path, real_claude: &Path) -> String {
     let ap = shell_quote(&agentprov.to_string_lossy());
     let rc = shell_quote(&real_claude.to_string_lossy());
+    // FAIL-OPEN: a `[ -x ]` check passes for a PRESENT-BUT-BROKEN binary
+    // (corrupt, panicking, or SIGKILLed — e.g. a bad codesign). Since `exec`
+    // replaces this shell, if we exec'd a dead agentprov the fallback line would
+    // never run and claude would never launch. So we PROBE first: run
+    // `agentprov __probe` (exits 0 if the binary is alive); only if that
+    // succeeds do we hand off. A dead binary fails the probe and falls through
+    // to running the real claude directly. Costs one fast spawn per launch.
     format!(
         "#!/bin/sh\n{SHIM_MARKER}\n\
          # Transparent agentprov recorder for claude. Fail-open. Reverse: agentprov-rs uninstall\n\
-         if [ -x {ap} ]; then\n  exec {ap} __shim {rc} \"$@\"\nfi\n\
-         # recorder unavailable — never break claude:\nexec {rc} \"$@\"\n"
+         if [ -x {ap} ] && {ap} __probe >/dev/null 2>&1; then\n  exec {ap} __shim {rc} \"$@\"\nfi\n\
+         # recorder unavailable or unhealthy — never break claude:\nexec {rc} \"$@\"\n"
     )
 }
 
@@ -153,27 +160,25 @@ pub fn shim(args: &[String]) -> i32 {
         return 2;
     }
     let real = PathBuf::from(&args[0]);
-    let claude_args: Vec<String> = args[1..].to_vec();
+    // ORIGINAL claude args, exactly as the user typed them. This is what we run
+    // on ANY fail-open fallback — never the --session-id-injected version, so a
+    // bad injection can't taint the fallback.
+    let orig_args: Vec<String> = args[1..].to_vec();
 
-    // Session dir under ~/.agentprov/sessions/<pid-timestamp>. We can't use
-    // Math.random/time in the workspace sandbox, but THIS is a normal binary —
-    // std::time is available here. ponytail: pid+nanos is unique enough for a
-    // per-session dir; a uuid dep would be overkill.
+    // Session dir under ~/.agentprov/sessions/<id>. Fail-open: if we can't even
+    // make the dir, run claude raw.
     let root = sessions_root();
     let id = session_id();
     let dir = root.join(&id);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("agentprov-rs: cannot create session dir {}: {e} — running claude unrecorded", dir.display());
-        return exec_real(&real, &claude_args);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return exec_real(&real, &orig_args);
     }
     let apcap = dir.join("session.apcap");
 
     // Pin the transcript: inject --session-id <uuid> so we can find the EXACT
-    // transcript claude writes (~/.claude/projects/<cwd>/<uuid>.jsonl) and build
-    // the signed semantic chain.jsonl from it — that's what the viewer's
-    // "Verified replay" + forensic event list render from. Skip if the user
-    // already passed a session flag (don't override --resume/--continue/etc).
-    let mut claude_args = claude_args;
+    // transcript claude writes and build the signed semantic chain.jsonl. Skip
+    // if the user already passed a session flag (don't override --resume etc).
+    let mut claude_args = orig_args.clone();
     let session_uuid = if looks_like_claude(&real) && !has_session_flag(&claude_args) {
         let u = new_uuid();
         claude_args.insert(0, format!("--session-id={u}"));
@@ -182,10 +187,26 @@ pub fn shim(args: &[String]) -> i32 {
         None
     };
 
-    // quiet=true: the shim wraps the user's normal claude — it must NOT spam the
-    // terminal on every exit. Fail-open: a capture/chain problem never alarms the
-    // user or changes the exit code.
-    let code = crate::capture_and_sign(&real, &claude_args, &apcap, true).unwrap_or(0);
+    // FAIL-OPEN: if PTY capture can't even START (capture_and_sign Err is
+    // PRE-fork only — pty-core never returns Err once the child started, so this
+    // can't double-run claude), run claude RAW with the ORIGINAL args so the
+    // user's claude never fails to launch because of the recorder OR a bad
+    // --session-id injection.
+    let code = match crate::capture_and_sign(&real, &claude_args, &apcap, true) {
+        Ok(code) => code,
+        Err(_) => return exec_real(&real, &orig_args),
+    };
+
+    // --session-id guard: if WE injected the flag and claude exited nonzero
+    // having produced almost no output, claude likely rejected --session-id
+    // (e.g. a future version dropped it). Re-run ONCE with the original args so
+    // the user's command still works. The tiny-output guard prevents re-running
+    // on a legitimate nonzero exit (where claude actually ran and produced a
+    // real session) — that would be a double-run. apcap_output_bytes reads the
+    // capture's recorded output size.
+    if session_uuid.is_some() && code != 0 && apcap_output_bytes(&apcap) < 64 {
+        return exec_real(&real, &orig_args);
+    }
 
     // Write session.cast (apcap → asciicast) for the viewer's "Real recording"
     // tab + video render. Best-effort, silent.
@@ -270,6 +291,17 @@ fn find_transcript(uuid: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Captured terminal-output bytes in an apcap (0 if it can't be read/verified).
+/// Used by the --session-id guard to tell "claude bailed immediately" from "real
+/// session that happened to exit nonzero".
+fn apcap_output_bytes(apcap: &Path) -> u64 {
+    std::fs::File::open(apcap)
+        .ok()
+        .and_then(|f| agentprov_replay_core::summarize(std::io::BufReader::new(f)).ok())
+        .map(|s| s.output_bytes)
+        .unwrap_or(0)
 }
 
 fn exec_real(real: &Path, args: &[String]) -> i32 {
@@ -361,5 +393,36 @@ pub fn list_sessions() {
         let apcap = d.join("session.apcap");
         let mark = if apcap.exists() { "✓" } else { "·" };
         println!("  {mark} {}", d.file_name().unwrap_or_default().to_string_lossy());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shim_script_probes_before_handoff() {
+        // The shim MUST probe the binary's health before `exec`ing it — a
+        // present-but-dead binary (corrupt/SIGKILLed) would otherwise break
+        // claude with no fallback (exec doesn't return).
+        let s = shim_script(Path::new("/bin/agentprov"), Path::new("/bin/claude.real"));
+        assert!(s.contains("__probe"), "shim must probe before handoff:\n{s}");
+        // The fallback exec of real claude must still be present for when the
+        // probe (or -x) fails.
+        assert!(s.contains("exec '/bin/claude.real'"), "shim must fall through to real claude");
+        // Probe must gate the handoff with && (short-circuit), not run regardless.
+        assert!(s.contains("__probe >/dev/null 2>&1; then"), "probe must gate the exec");
+    }
+
+    #[test]
+    fn session_flag_detection() {
+        // We must NOT inject --session-id when the user already chose a session.
+        assert!(has_session_flag(&["--resume".into()]));
+        assert!(has_session_flag(&["-c".into()]));
+        assert!(has_session_flag(&["--session-id=abc".into()]));
+        assert!(has_session_flag(&["--continue".into()]));
+        // A plain prompt run has no session flag → injection is allowed.
+        assert!(!has_session_flag(&["-p".into(), "hello".into()]));
+        assert!(!has_session_flag(&[]));
     }
 }

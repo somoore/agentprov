@@ -638,6 +638,10 @@ fn main() {
             Ok(()) => process::exit(0),
             Err(e) => { eprintln!("agentprov-rs: uninstall failed: {e}"); process::exit(1); }
         },
+        // __probe: a trivial liveness check the shim runs BEFORE handing off, so
+        // a present-but-broken binary (corrupt/SIGKILLed) fails the probe and the
+        // shim falls through to running claude raw. Must do nothing but exit 0.
+        Some("__probe") => process::exit(0),
         // __shim is the runtime entry the installed shim execs; it records the
         // session and exits with claude's exit code.
         Some("__shim") => process::exit(install::shim(&argv[2..])),
