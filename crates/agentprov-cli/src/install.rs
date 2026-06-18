@@ -168,16 +168,15 @@ pub fn shim(args: &[String]) -> i32 {
     }
     let apcap = dir.join("session.apcap");
 
-    match crate::capture_and_sign(&real, &claude_args, &apcap) {
-        Ok(code) => {
-            eprintln!("agentprov-rs: session recorded -> {}", dir.display());
-            code
-        }
-        Err(e) => {
-            // FAIL-OPEN at runtime too: if capture itself fails, the user already
-            // got their claude session via the capture path's child; only signing
-            // or dir bookkeeping failed. Report, don't mask the exit code.
-            eprintln!("agentprov-rs: recording problem: {e}");
+    // quiet=true: the shim wraps the user's normal claude — it must NOT spam the
+    // terminal on every exit. Recording happens silently; `agentprov-rs sessions`
+    // / `view` surface it when the user wants it.
+    match crate::capture_and_sign(&real, &claude_args, &apcap, true) {
+        Ok(code) => code,
+        Err(_) => {
+            // FAIL-OPEN at runtime: the user already got their claude session via
+            // the capture child; only signing/bookkeeping failed. Stay silent —
+            // don't alarm the user mid-workflow — and preserve a clean exit.
             0
         }
     }

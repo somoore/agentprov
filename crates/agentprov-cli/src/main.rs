@@ -202,7 +202,7 @@ fn cmd_run(argv: &[String]) {
             process::exit(2);
         }
     };
-    match capture_and_sign(&run_args.command, &run_args.args, &run_args.out) {
+    match capture_and_sign(&run_args.command, &run_args.args, &run_args.out, false) {
         Ok(code) => process::exit(code),
         Err(e) => {
             eprintln!("agentprov-rs: failed to run capture session: {e}");
@@ -220,14 +220,17 @@ pub(crate) fn capture_and_sign(
     command: &Path,
     args: &[String],
     out: &Path,
+    quiet: bool,
 ) -> Result<i32, String> {
     let session = CaptureSession::new(command.to_path_buf(), args.to_vec(), out.to_path_buf());
     let result = session.run().map_err(|e| e.to_string())?;
 
-    eprintln!(
-        "agentprov-rs: captured {} frames to {} (exit {})",
-        result.frames_written, out.display(), result.exit_code,
-    );
+    if !quiet {
+        eprintln!(
+            "agentprov-rs: captured {} frames to {} (exit {})",
+            result.frames_written, out.display(), result.exit_code,
+        );
+    }
 
     match read_tip(out) {
         Ok((_, tip)) => {
@@ -237,17 +240,19 @@ pub(crate) fn capture_and_sign(
             let w1 = std::fs::write(&pub_path, integrity::to_hex(&signer.public_key()));
             let w2 = std::fs::write(&sig_path, integrity::to_hex(&sig));
             match (w1, w2) {
-                (Ok(()), Ok(())) => {
+                (Ok(()), Ok(())) if !quiet => {
                     let src = match signer.source {
                         KeySource::Keychain => "keychain-bound",
                         KeySource::Ephemeral => "EPHEMERAL (not non-repudiable — keychain unavailable)",
                     };
                     eprintln!("agentprov-rs: signed tip with {src} key → {}", sig_path.display());
                 }
+                (Ok(()), Ok(())) => {}
                 _ => eprintln!("agentprov-rs: warning: could not write signature sidecars"),
             }
         }
-        Err(e) => eprintln!("agentprov-rs: warning: could not sign capture: {e}"),
+        Err(e) if !quiet => eprintln!("agentprov-rs: warning: could not sign capture: {e}"),
+        Err(_) => {}
     }
     Ok(result.exit_code)
 }
