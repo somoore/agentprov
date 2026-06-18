@@ -150,7 +150,10 @@
   #termpre .tbreak{color:#f85149;font-weight:700;}      /* tamper break */
   #termpre .tidle{color:#d9a441;font-weight:700;}       /* human idle gap */
   #termpre .tflow{color:#5ec8e0;font-weight:700;}        /* OS-observed network egress (agentsnitch) */
-  #termpre .tcur{background:#c9d1d9;color:#1a1d23;animation:blink 1.05s steps(1) infinite;}
+  /* terminal cursor: a single character-cell block, NOT a full-width <pre> bar.
+     display:inline-block + ch width keeps it one glyph wide; the <pre> default
+     (display:block) was painting the whole line grey. */
+  #termpre .tcur{display:inline-block;width:1ch;height:1.2em;vertical-align:text-bottom;background:#c9d1d9;animation:blink 1.05s steps(1) infinite;}
   @keyframes blink{50%{opacity:0;}}
   /* banner / footer chrome */
   .termchrome{background:#1a1d23;font-family:"Menlo","SF Mono",ui-monospace,monospace;font-size:14px;line-height:19px;}
@@ -591,7 +594,7 @@ function eventHTML(i){
 function fullRebuild(){
   let body="";
   for(let i=0;i<=cursor && i<timeline.length;i++) body+=eventHTML(i);
-  $("#termpre").innerHTML=body+`<pre class="tevent tbreak" id="tbreakmark"></pre><pre class="tevent tcur"> </pre>`;
+  $("#termpre").innerHTML=body+`<pre class="tevent tbreak" id="tbreakmark"></pre><span class="tcur"></span>`;
   rendered=cursor;
 }
 function renderTerminal(){

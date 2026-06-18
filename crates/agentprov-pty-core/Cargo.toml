@@ -1,0 +1,19 @@
+[package]
+name = "agentprov-pty-core"
+version.workspace = true
+description = "Dependency-minimal PTY capture core: spawn a child under a PTY, proxy I/O, record output as hash-chained frames."
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentprov-capture-format = { path = "../agentprov-capture-format" }
+rustix.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+agentprov-integrity = { path = "../agentprov-integrity" }

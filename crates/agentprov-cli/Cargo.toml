@@ -1,0 +1,22 @@
+[package]
+name = "agentprov-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentprov-rs"
+path = "src/main.rs"
+
+[dependencies]
+agentprov-capture-format = { path = "../agentprov-capture-format" }
+agentprov-pty-core = { path = "../agentprov-pty-core" }
+agentprov-integrity = { path = "../agentprov-integrity" }
+agentprov-replay-core = { path = "../agentprov-replay-core" }
+agentprov-viewer = { path = "../agentprov-viewer" }
+agentprov-export = { path = "../agentprov-export" }
+agentprov-collectors = { path = "../agentprov-collectors" }
+agentprov-chain = { path = "../agentprov-chain" }
+
+[dev-dependencies]
+sha2 = { workspace = true }

@@ -1,0 +1,14 @@
+[package]
+name = "agentprov-replay-core"
+version.workspace = true
+description = "Convert verified APCAP capture frames to asciicast v2, with summary and range/seek — always chain-checked."
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentprov-capture-format = { path = "../agentprov-capture-format" }

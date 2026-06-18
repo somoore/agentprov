@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agentprov-pty-core",
+    "crates/agentprov-capture-format",
+    "crates/agentprov-integrity",
+    "crates/agentprov-chain",
+    "crates/agentprov-replay-core",
+    "crates/agentprov-collectors",
+    "crates/agentprov-viewer",
+    "crates/agentprov-export",
+    "crates/agentprov-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Scott Moore"]
+repository = "https://github.com/somoore/agentprov"
+homepage = "https://github.com/somoore/agentprov"
+keywords = ["pty", "tamper-evident", "provenance", "audit", "security"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.87"
+
+# ponytail: tier-0 deps pinned here so the trusted path stays auditable.
+# sha2 = frame hash (matches the Go chain's sha256). rustix = thin syscall layer
+# for the PTY (no tokio, no portable-pty/wezterm — we own the capture semantics).
+[workspace.dependencies]
+sha2 = "0.10"
+rustix = { version = "0.38", features = ["pty", "termios", "process", "fs", "stdio"] }
+libc = "0.2"

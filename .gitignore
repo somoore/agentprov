@@ -1,18 +1,108 @@
-# build output — root binary only. NOT the plugin/agentprov dir (bare
-# 'agentprov' matched plugin/agentprov/ and silently dropped the whole plugin).
+# ──────────────────────────────────────────────────────────────────────────
+# agentprov — project-specific artifacts (DO NOT remove these; they are why
+# the repo stays clean of recorded sessions, signatures, and the root binary).
+# ──────────────────────────────────────────────────────────────────────────
+
+# Build output — root binary only. NOT the plugin/agentprov dir: a bare
+# 'agentprov' line once matched plugin/agentprov/ and silently dropped the
+# whole plugin. Keep this anchored to the repo root.
 /agentprov
 
-# recorder artifacts
+# Recorder artifacts: signed chains, captures, signatures, overlays. These are
+# evidence/output, never source.
 chain.jsonl
 chain.pub
+*.apcap
+*.apcap.pub
+*.apcap.sig
 *.chain.jsonl
-
-# os
-.DS_Store
 session.cast
 flows.jsonl
 *.cast
-*.gif
-*.mp4
 agentprov-sample.jsonl
 agentprov-session.*
+
+# Rendered media (export output — regenerated from captures).
+*.gif
+*.mp4
+*.webm
+
+# ──────────────────────────────────────────────────────────────────────────
+# Rust
+# ──────────────────────────────────────────────────────────────────────────
+/target
+**/target
+# Cargo.lock IS committed (this workspace ships binaries) — do not ignore it.
+*.rs.bk
+*.pdb
+
+# ──────────────────────────────────────────────────────────────────────────
+# Go
+# ──────────────────────────────────────────────────────────────────────────
+# Compiled binaries / archives
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+# Go workspace / vendor (we don't vendor; ignore if it appears)
+go.work
+go.work.sum
+# Coverage / profiling
+*.cover
+coverage.txt
+cpu.prof
+mem.prof
+
+# ──────────────────────────────────────────────────────────────────────────
+# macOS
+# ──────────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+.fseventsd
+.DocumentRevisions-V100
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+Icon
+
+# ──────────────────────────────────────────────────────────────────────────
+# Windows
+# ──────────────────────────────────────────────────────────────────────────
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.cab
+*.msi
+*.msm
+*.msp
+
+# ──────────────────────────────────────────────────────────────────────────
+# Editors / IDEs
+# ──────────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+.zed/
+
+# ──────────────────────────────────────────────────────────────────────────
+# Misc
+# ──────────────────────────────────────────────────────────────────────────
+*.log
+tmp/
+.env
+.env.local
