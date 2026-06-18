@@ -168,12 +168,108 @@ pub fn shim(args: &[String]) -> i32 {
     }
     let apcap = dir.join("session.apcap");
 
+    // Pin the transcript: inject --session-id <uuid> so we can find the EXACT
+    // transcript claude writes (~/.claude/projects/<cwd>/<uuid>.jsonl) and build
+    // the signed semantic chain.jsonl from it — that's what the viewer's
+    // "Verified replay" + forensic event list render from. Skip if the user
+    // already passed a session flag (don't override --resume/--continue/etc).
+    let mut claude_args = claude_args;
+    let session_uuid = if looks_like_claude(&real) && !has_session_flag(&claude_args) {
+        let u = new_uuid();
+        claude_args.insert(0, format!("--session-id={u}"));
+        Some(u)
+    } else {
+        None
+    };
+
     // quiet=true: the shim wraps the user's normal claude — it must NOT spam the
-    // terminal on every exit. Recording is silent; `agentprov sessions` / `view`
-    // surface it on demand. Runtime fail-open: on error the user already got
-    // their claude session via the capture child; only signing/bookkeeping
-    // failed, so stay silent and return a clean exit rather than alarm them.
-    crate::capture_and_sign(&real, &claude_args, &apcap, true).unwrap_or(0)
+    // terminal on every exit. Fail-open: a capture/chain problem never alarms the
+    // user or changes the exit code.
+    let code = crate::capture_and_sign(&real, &claude_args, &apcap, true).unwrap_or(0);
+
+    // Write session.cast (apcap → asciicast) for the viewer's "Real recording"
+    // tab + video render. Best-effort, silent.
+    let cast = dir.join("session.cast");
+    if let Ok(apcap_f) = std::fs::File::open(&apcap) {
+        if let Ok(cast_f) = std::fs::File::create(&cast) {
+            let _ = agentprov_replay_core::to_asciicast(
+                std::io::BufReader::new(apcap_f),
+                std::io::BufWriter::new(cast_f),
+            );
+        }
+    }
+
+    // Build the signed semantic chain from the transcript, binding the cast in
+    // (so the viewer shows both tabs). Best-effort, silent.
+    if let Some(uuid) = session_uuid {
+        if let Some(transcript) = find_transcript(&uuid) {
+            let cast_arg = cast.exists().then_some(cast.as_path());
+            let _ = agentprov_chain::record_transcript_with_cast(&transcript, &dir, cast_arg);
+        }
+    }
+    code
+}
+
+/// True if `path` is (a renamed) claude — handles claude.agentprov-real etc.
+fn looks_like_claude(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with("claude"))
+        .unwrap_or(false)
+}
+
+/// Don't inject a session id if the user already chose one.
+fn has_session_flag(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        matches!(a.as_str(), "--session-id" | "--resume" | "-r" | "--continue" | "-c" | "--fork-session")
+            || a.starts_with("--session-id=")
+            || a.starts_with("--resume=")
+    })
+}
+
+/// Random v4 UUID, no external dep.
+fn new_uuid() -> String {
+    let mut b = [0u8; 16];
+    // getrandom would be a dep; use the OS via /dev/urandom-equivalent: std has
+    // no RNG, but agentprov-integrity already pulls rand_core/getrandom. Reuse it.
+    // (capture_and_sign already links it; this keeps the dep surface flat.)
+    if getrandom_fill(&mut b).is_err() {
+        // fail-open: a non-random id still pins a unique-enough path via pid+time.
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let p = std::process::id();
+        return format!("agentprov-{t:x}-{p:x}");
+    }
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]
+    )
+}
+
+fn getrandom_fill(buf: &mut [u8]) -> Result<(), ()> {
+    // Read from /dev/urandom — std-only, no dep.
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(buf))
+        .map_err(|_| ())
+}
+
+/// Find the transcript claude wrote for `uuid`. Claude encodes the cwd into the
+/// projects dir name (slashes → dashes), so we scan ~/.claude/projects/*/ for
+/// <uuid>.jsonl rather than reconstruct the exact encoding.
+fn find_transcript(uuid: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let projects = PathBuf::from(home).join(".claude").join("projects");
+    let target = format!("{uuid}.jsonl");
+    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
+        let cand = entry.path().join(&target);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
 }
 
 fn exec_real(real: &Path, args: &[String]) -> i32 {
@@ -197,6 +293,40 @@ fn session_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{nanos}-{}", std::process::id())
+}
+
+/// Launch the original two-tab flight-recorder viewer on `chain`. That UI
+/// (viewer.html) is served by the Go `agentprov` binary, which serves
+/// /chain + /cast + /video the page expects. We shell to it rather than
+/// re-implement a working viewer. Looks for the Go binary next to ours.
+pub fn launch_flight_recorder(chain: &Path) -> Result<(), String> {
+    let self_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    // Candidate names for the Go viewer binary.
+    let candidates = [
+        self_dir.join("agentprov.go-old"),
+        self_dir.join("agentprov-go"),
+        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("github/agentprov/agentprov"),
+    ];
+    let go = candidates.iter().find(|p| p.is_file()).ok_or_else(|| {
+        format!(
+            "the flight-recorder viewer (Go binary) was not found.\n  Looked in: {}\n  Build it: cd <agentprov repo> && go build -o ~/.local/bin/agentprov.go-old .",
+            candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        )
+    })?;
+    // Exec `<go> view <chain>` — it serves viewer.html, binds loopback, opens the
+    // browser, and blocks. Inherit stdio so its URL print reaches the user.
+    let status = Command::new(go)
+        .arg("view")
+        .arg(chain)
+        .status()
+        .map_err(|e| format!("launching viewer: {e}"))?;
+    if !status.success() {
+        return Err(format!("viewer exited with status {status}"));
+    }
+    Ok(())
 }
 
 /// Newest recorded session's `session.apcap`, if any. Lets `view`/`verify`/`cast`

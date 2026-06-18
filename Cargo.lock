@@ -10,10 +10,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentprov-chain"
+version = "0.1.0"
+dependencies = [
+ "agentprov-integrity",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "agentprov-cli"
 version = "0.1.0"
 dependencies = [
  "agentprov-capture-format",
+ "agentprov-chain",
  "agentprov-collectors",
  "agentprov-export",
  "agentprov-integrity",
@@ -72,6 +83,8 @@ name = "agentprov-viewer"
 version = "0.1.0"
 dependencies = [
  "agentprov-capture-format",
+ "agentprov-collectors",
+ "agentprov-export",
  "agentprov-integrity",
  "agentprov-replay-core",
  "getrandom 0.2.17",

@@ -23,11 +23,72 @@
 //! - **Fail-closed** — `to_asciicast` is called once at startup. On tamper
 //!   `Err`, all data routes return an error page.
 
-use agentprov_replay_core::{summarize, to_asciicast, ReplaySummary};
+use agentprov_collectors::Flow;
+use agentprov_replay_core::{frame_log, summarize, to_asciicast, FrameEntry, ReplaySummary};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+// ── JSON builders (hand-rolled, no serde — matches the viewer's no-dep style) ──
+
+/// Escape a string as a JSON value body (no surrounding quotes).
+fn json_str(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                let _ = write!(o, "\\u{:04x}", c as u32);
+            }
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// Build the tamper-evident log as a JSON array.
+fn frame_log_json(entries: &[FrameEntry]) -> Vec<u8> {
+    let mut s = String::from("[");
+    for (i, e) in entries.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        use std::fmt::Write as _;
+        let _ = write!(
+            s,
+            "{{\"seq\":{},\"kind\":\"{}\",\"at\":{:.3},\"bytes\":{},\"hash\":\"{}\"}}",
+            e.seq, json_str(&e.kind), e.at_secs, e.bytes, json_str(&e.hash_hex)
+        );
+    }
+    s.push(']');
+    s.into_bytes()
+}
+
+/// Build the network-flow overlay as a JSON array. confidence/why/linked_tool
+/// are agentsnitch's CLAIM — the frontend labels them as such, never our verdict.
+fn flows_json(flows: &[Flow]) -> Vec<u8> {
+    let mut s = String::from("[");
+    for (i, f) in flows.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        use std::fmt::Write as _;
+        let _ = write!(
+            s,
+            "{{\"ts\":\"{}\",\"host\":\"{}\",\"direction\":\"{}\",\"bytes_out\":{},\"linked_tool\":\"{}\",\"confidence\":\"{}\",\"why\":\"{}\"}}",
+            json_str(&f.ts), json_str(&f.host), json_str(&f.direction),
+            f.bytes_out, json_str(&f.linked_tool), json_str(&f.confidence), json_str(&f.why)
+        );
+    }
+    s.push(']');
+    s.into_bytes()
+}
 
 // ── embedded web assets ──────────────────────────────────────────────────────
 
@@ -73,6 +134,16 @@ pub enum Route {
     Boot,
     /// Token-gated verified asciicast.
     Cast,
+    /// Panel JS that fetches /log and /flows (served from 'self' so CSP passes).
+    PanelJs,
+    /// Token-gated tamper-evident frame-log JSON.
+    Log,
+    /// Token-gated network-flow overlay JSON.
+    Flows,
+    /// Token-gated GIF render (download).
+    DownloadGif,
+    /// Token-gated MP4 render (download).
+    DownloadMp4,
     /// Wrong or missing token on a gated route.
     Forbidden,
     /// Anything not in the allowlist (includes path-traversal attempts).
@@ -100,27 +171,22 @@ pub fn route(path: &str, token: &str) -> Route {
         return Route::NotFound;
     }
 
+    // Token-gated routes carry capture data — require the exact token or 403.
+    let gated = |r: Route| if token_matches(query, token) { r } else { Route::Forbidden };
+
     match path_only {
-        // Token-gated routes — capture data flows through here.
-        "/" => {
-            if token_matches(query, token) {
-                Route::Index
-            } else {
-                Route::Forbidden
-            }
-        }
-        "/cast" => {
-            if token_matches(query, token) {
-                Route::Cast
-            } else {
-                Route::Forbidden
-            }
-        }
-        // Static vendored assets — no capture data, no token needed.
+        "/" => gated(Route::Index),
+        "/cast" => gated(Route::Cast),
+        "/log" => gated(Route::Log),
+        "/flows" => gated(Route::Flows),
+        "/download.gif" => gated(Route::DownloadGif),
+        "/download.mp4" => gated(Route::DownloadMp4),
+        // Static assets / panel JS — no capture data, no token needed.
         "/player.js" => Route::Player,
         "/player.css" => Route::Css,
         "/font.ttf" => Route::Font,
         "/boot.js" => Route::Boot,
+        "/panel.js" => Route::PanelJs,
         // Anything else (including /../../etc/passwd after stripping query).
         _ => Route::NotFound,
     }
@@ -166,12 +232,16 @@ pub fn security_headers() -> &'static str {
 ///
 /// The cast URL embeds the token in data-cast so the inline-free CSP passes.
 /// `AsciinemaPlayer.create` is called from /boot.js (served from 'self').
-fn index_html(summary: &ReplaySummary, token: &str) -> Vec<u8> {
+fn index_html(summary: &ReplaySummary, token: &str, can_gif: bool, can_mp4: bool) -> Vec<u8> {
     let cmd = html_escape(&summary.command);
     let exit = html_escape(&summary.exit);
     let duration = format!("{:.1}s", summary.duration_secs);
     let dims = format!("{}×{}", summary.width, summary.height);
     let tip = &summary.tip_hex[..12.min(summary.tip_hex.len())];
+    let frames = summary.frames;
+    // Download buttons — disabled (with reason) when the renderer is missing.
+    let gif_btn = download_btn("download.gif", "Download GIF", can_gif, token);
+    let mp4_btn = download_btn("download.mp4", "Download MP4", can_mp4, token);
 
     let html = format!(
         r#"<!doctype html>
@@ -193,8 +263,20 @@ header .tag{{color:var(--dim);font-size:13px;}}
 .badge b{{color:var(--ink);}}
 .ok{{color:var(--ok);font-weight:700;}}
 .container{{max-width:1100px;margin:0 auto;padding:20px 24px 60px;}}
-.meta{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;}}
+.meta{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;align-items:center;}}
 #player{{border:1px solid var(--line);border-radius:8px;overflow:hidden;height:500px;}}
+.actions{{margin:16px 0;display:flex;gap:10px;}}
+.btn{{display:inline-block;padding:7px 14px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);font:13px var(--mono);text-decoration:none;cursor:pointer;}}
+.btn[aria-disabled="true"]{{opacity:.4;pointer-events:none;}}
+.section{{margin-top:24px;border:1px solid var(--line);border-radius:8px;background:var(--panel);}}
+.section>summary,.section>.shead{{padding:12px 16px;font:13px var(--mono);color:var(--dim);cursor:pointer;user-select:none;}}
+#logbox{{padding:0 16px 16px;overflow:auto;}}
+#logbox table{{width:100%;border-collapse:collapse;font:12px var(--mono);}}
+#logbox th,#logbox td{{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);color:var(--ink);}}
+#logbox th{{color:var(--dim);}}
+#flowbox{{padding:0 16px 16px;}}
+.flow{{padding:8px 0;border-bottom:1px solid var(--line);font:12px var(--mono);}}
+.claim{{color:var(--dim);font-style:italic;margin-top:3px;}}
 </style>
 </head>
 <body>
@@ -217,14 +299,35 @@ header .tag{{color:var(--dim);font-size:13px;}}
        data-fit="both"
        data-font-size="14px">
   </div>
+  <div class="actions">{gif_btn}{mp4_btn}</div>
+
+  <div class="section">
+    <div class="shead" id="logbtn">▸ Tamper-evident log — {frames} frames · <span class="ok">SIGNATURE VALID</span> · tip {tip}…</div>
+    <div id="logbox" hidden></div>
+  </div>
+
+  <div class="section">
+    <div class="shead">Network egress (OS-observed; correlation is agentsnitch's claim)</div>
+    <div id="flowbox"></div>
+  </div>
 </div>
 <script src="/player.js"></script>
 <script src="/boot.js"></script>
+<script src="/panel.js"></script>
 </body>
 </html>
 "#
     );
     html.into_bytes()
+}
+
+/// One download button. Disabled (with a reason title) when the renderer is absent.
+fn download_btn(route: &str, label: &str, enabled: bool, token: &str) -> String {
+    if enabled {
+        format!(r#"<a class="btn" href="/{route}?t={token}">{label}</a>"#)
+    } else {
+        format!(r#"<span class="btn" aria-disabled="true" title="install agg/ffmpeg to enable">{label}</span>"#)
+    }
 }
 
 /// A minimal error page served when APCAP verification fails.
@@ -255,6 +358,41 @@ h1{{color:#f85149;}}pre{{background:#11151f;border:1px solid #1e2433;padding:12p
 /// Served from /boot.js so CSP `script-src 'self'` allows it.
 fn boot_js() -> &'static [u8] {
     b"(function(){var el=document.getElementById('player');if(!el)return;var cast=el.getAttribute('data-cast');var theme=el.getAttribute('data-theme')||'asciinema';var fit=el.getAttribute('data-fit')||'both';var fontSize=el.getAttribute('data-font-size')||'14px';if(window.AsciinemaPlayer&&cast){AsciinemaPlayer.create(cast,el,{theme:theme,fit:fit,terminalFontSize:fontSize,autoPlay:false});}})();\n"
+}
+
+/// Panel JS: fetches /log and /flows (with the token from the URL) and renders
+/// the tamper-evident log table + network overlay. Served from 'self' so the
+/// strict CSP (no inline script) passes. Pure DOM building — no innerHTML with
+/// untrusted data (textContent only), so terminal/flow strings can't inject.
+fn panel_js() -> &'static [u8] {
+    br#"(function(){
+var t=new URLSearchParams(location.search).get('t');
+function mk(tag,txt){var e=document.createElement(tag);if(txt!=null)e.textContent=txt;return e;}
+// Tamper-evident log
+var logBtn=document.getElementById('logbtn'),logBox=document.getElementById('logbox');
+if(logBtn){logBtn.addEventListener('click',function(){
+  if(logBox.dataset.loaded){logBox.hidden=!logBox.hidden;return;}
+  fetch('/log?t='+encodeURIComponent(t)).then(function(r){return r.json();}).then(function(rows){
+    var tbl=mk('table');var h=mk('tr');['seq','time','kind','bytes','hash'].forEach(function(c){h.appendChild(mk('th',c));});tbl.appendChild(h);
+    rows.forEach(function(r){var tr=mk('tr');
+      tr.appendChild(mk('td',r.seq));tr.appendChild(mk('td',r.at.toFixed(3)+'s'));
+      tr.appendChild(mk('td',r.kind));tr.appendChild(mk('td',r.bytes));
+      tr.appendChild(mk('td',r.hash.slice(0,12)+'...'));tbl.appendChild(tr);});
+    logBox.appendChild(tbl);logBox.dataset.loaded='1';logBox.hidden=false;
+  });
+});}
+// Network overlay
+var flowBox=document.getElementById('flowbox');
+if(flowBox){fetch('/flows?t='+encodeURIComponent(t)).then(function(r){return r.json();}).then(function(rows){
+  if(!rows.length){flowBox.appendChild(mk('p','No network overlay (run: agentprov flows <events.jsonl> <session-dir>).'));return;}
+  rows.forEach(function(f){var d=mk('div');d.className='flow';
+    d.appendChild(mk('span',f.direction+' '+f.host+'  '+f.bytes_out+'B  '+f.ts));
+    if(f.linked_tool||f.confidence){var c=mk('div');c.className='claim';
+      c.textContent='agentsnitch reports: linked to '+f.linked_tool+' (confidence: '+f.confidence+')'+(f.why?' - '+f.why:'');d.appendChild(c);}
+    flowBox.appendChild(d);});
+});}
+})();
+"#
 }
 
 /// Minimal HTML escaping for values inserted into HTML attributes/text.
@@ -297,6 +435,39 @@ fn write_not_found(stream: &mut TcpStream) -> io::Result<()> {
     write_response(stream, "404 Not Found", "text/plain; charset=utf-8", b"404 Not Found")
 }
 
+/// Render the capture to gif/mp4 (server-side, via export crate) and stream it
+/// as a download. The apcap path is SERVER-side (never from the request), and
+/// export goes through replay-core so a tampered capture fails to render.
+fn write_render(
+    stream: &mut TcpStream,
+    state: &Arc<ServerState>,
+    format: agentprov_export::Format,
+) -> io::Result<()> {
+    let (ext, ctype) = match format {
+        agentprov_export::Format::Gif => ("gif", "image/gif"),
+        agentprov_export::Format::Mp4 => ("mp4", "video/mp4"),
+    };
+    let tmp = std::env::temp_dir().join(format!("agentprov-view-{}.{ext}", std::process::id()));
+    if let Err(e) = agentprov_export::render(&state.apcap_path, &tmp, format) {
+        let _ = std::fs::remove_file(&tmp);
+        return write_response(
+            stream,
+            "500 Internal Server Error",
+            "text/plain; charset=utf-8",
+            format!("render failed: {e}").as_bytes(),
+        );
+    }
+    let body = std::fs::read(&tmp).unwrap_or_default();
+    let _ = std::fs::remove_file(&tmp);
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"session.{ext}\"\r\nCache-Control: no-store\r\n{}\r\n",
+        body.len(), security_headers()
+    );
+    stream.write_all(headers.as_bytes())?;
+    stream.write_all(&body)?;
+    Ok(())
+}
+
 fn write_method_not_allowed(stream: &mut TcpStream) -> io::Result<()> {
     write_response(
         stream,
@@ -329,44 +500,73 @@ struct ServerState {
     index_html: Vec<u8>,
     /// Error HTML (used when cast_bytes is None).
     error_html: Vec<u8>,
+    /// SERVER-side apcap path — used to render video on demand. Never from a
+    /// request (no path-traversal surface).
+    apcap_path: PathBuf,
+    /// Pre-built tamper-evident log JSON (the frame chain). Empty if verify failed.
+    log_json: Vec<u8>,
+    /// Pre-built network-flow overlay JSON (from a sibling flows.jsonl, if any).
+    flows_json: Vec<u8>,
 }
 
 impl ServerState {
     fn new(apcap_path: &PathBuf) -> io::Result<Self> {
         let token = gen_token();
-
-        // Read the APCAP file once.
         let apcap_bytes = std::fs::read(apcap_path)?;
 
-        // Attempt to summarize (chain-verifies internally).
-        let summary_result = summarize(&apcap_bytes[..]);
+        // Renderer availability (for the download buttons).
+        let renderers = agentprov_export::renderers_available();
+        let can_gif = renderers.agg;
+        let can_mp4 = renderers.agg && renderers.ffmpeg;
 
-        match summary_result {
+        // Network-flow overlay: optional sibling flows.jsonl next to the apcap.
+        let flows_json = load_flows_json(apcap_path);
+
+        match summarize(&apcap_bytes[..]) {
             Ok(summary) => {
-                // Generate verified asciicast.
                 let mut cast_buf = Vec::new();
                 to_asciicast(&apcap_bytes[..], &mut cast_buf)
                     .map_err(|e| io::Error::other(e.to_string()))?;
 
-                let idx = index_html(&summary, &token);
+                // Tamper-evident log JSON (frame chain).
+                let log_json = match frame_log(&apcap_bytes[..]) {
+                    Ok(entries) => frame_log_json(&entries),
+                    Err(_) => b"[]".to_vec(),
+                };
+
+                let idx = index_html(&summary, &token, can_gif, can_mp4);
                 Ok(Self {
                     index_html: idx,
                     cast_bytes: Some(cast_buf),
-                    error_html: Vec::new(), // not used when verified
+                    error_html: Vec::new(),
                     token,
+                    apcap_path: apcap_path.clone(),
+                    log_json,
+                    flows_json,
                 })
             }
-            Err(e) => {
-                let err_html = error_html(&e.to_string());
-                Ok(Self {
-                    token,
-                    cast_bytes: None,
-                    index_html: Vec::new(), // not used when failed
-                    error_html: err_html,
-                })
-            }
+            Err(e) => Ok(Self {
+                index_html: Vec::new(),
+                cast_bytes: None,
+                error_html: error_html(&e.to_string()),
+                token,
+                apcap_path: apcap_path.clone(),
+                log_json: b"[]".to_vec(),
+                flows_json,
+            }),
         }
     }
+}
+
+/// Load + parse a sibling `flows.jsonl` next to the apcap into overlay JSON.
+/// Missing file → empty array (no overlay; never an error).
+fn load_flows_json(apcap_path: &Path) -> Vec<u8> {
+    let flows_path = apcap_path.with_file_name("flows.jsonl");
+    let Ok(file) = std::fs::File::open(&flows_path) else {
+        return b"[]".to_vec();
+    };
+    let flows = agentprov_collectors::parse_flows(BufReader::new(file));
+    flows_json(&flows)
 }
 
 // ── connection handler ────────────────────────────────────────────────────────
@@ -441,6 +641,16 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) {
             "application/javascript; charset=utf-8",
             boot_js(),
         ),
+        Route::PanelJs => write_response(
+            &mut stream,
+            "200 OK",
+            "application/javascript; charset=utf-8",
+            panel_js(),
+        ),
+        Route::Log => write_response(&mut stream, "200 OK", "application/json", &state.log_json),
+        Route::Flows => write_response(&mut stream, "200 OK", "application/json", &state.flows_json),
+        Route::DownloadGif => write_render(&mut stream, state, agentprov_export::Format::Gif),
+        Route::DownloadMp4 => write_render(&mut stream, state, agentprov_export::Format::Mp4),
         Route::Forbidden => write_forbidden(&mut stream),
         Route::NotFound => write_not_found(&mut stream),
     };
@@ -711,5 +921,34 @@ mod tests {
     fn parse_request_line_malformed_returns_none() {
         assert!(parse_request_line("BADLINE").is_none());
         assert!(parse_request_line("").is_none());
+    }
+
+    #[test]
+    fn new_data_routes_are_token_gated() {
+        let tok = "secrettoken";
+        // Correct token → the intended route.
+        assert_eq!(route("/log?t=secrettoken", tok), Route::Log);
+        assert_eq!(route("/flows?t=secrettoken", tok), Route::Flows);
+        assert_eq!(route("/download.gif?t=secrettoken", tok), Route::DownloadGif);
+        assert_eq!(route("/download.mp4?t=secrettoken", tok), Route::DownloadMp4);
+        // Wrong / missing token → Forbidden, never the data route.
+        assert_eq!(route("/log?t=wrong", tok), Route::Forbidden);
+        assert_eq!(route("/flows", tok), Route::Forbidden);
+        assert_eq!(route("/download.gif", tok), Route::Forbidden);
+        // panel.js needs no token (no capture data).
+        assert_eq!(route("/panel.js", tok), Route::PanelJs);
+        // Traversal on a data route → NotFound, never a file read.
+        assert_eq!(route("/../log?t=secrettoken", tok), Route::NotFound);
+    }
+
+    #[test]
+    fn log_json_has_frames_and_hashes() {
+        let apcap = make_apcap();
+        let entries = frame_log(&apcap[..]).unwrap();
+        let json = String::from_utf8(frame_log_json(&entries)).unwrap();
+        assert!(json.starts_with('['));
+        assert!(json.contains("\"seq\":0"));
+        assert!(json.contains("\"hash\":\""));
+        assert!(json.contains("\"kind\":\"SessionStart\""));
     }
 }

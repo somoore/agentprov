@@ -69,6 +69,14 @@ impl Signing {
     pub fn sign_tip(&self, tip: &[u8; 32]) -> [u8; SIG_LEN] {
         self.key.sign(tip).to_bytes()
     }
+
+    /// Sign an arbitrary-length message. The Go semantic-chain recorder signs the
+    /// 64-char hex *hash string* of each node (`ed25519.Sign(priv, []byte(hash))`),
+    /// not a fixed 32-byte tip — so the per-node `sig` field is produced by signing
+    /// `hash_hex.as_bytes()` here. Used by `agentprov-chain`.
+    pub fn sign_bytes(&self, msg: &[u8]) -> [u8; SIG_LEN] {
+        self.key.sign(msg).to_bytes()
+    }
 }
 
 /// The verifying (public) key bound in this machine's keychain, if present.

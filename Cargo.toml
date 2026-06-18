@@ -4,6 +4,7 @@ members = [
     "crates/agentprov-pty-core",
     "crates/agentprov-capture-format",
     "crates/agentprov-integrity",
+    "crates/agentprov-chain",
     "crates/agentprov-replay-core",
     "crates/agentprov-collectors",
     "crates/agentprov-viewer",

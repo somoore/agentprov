@@ -298,6 +298,54 @@ pub fn summarize<R: Read>(apcap: R) -> Result<ReplaySummary, ReplayError> {
     })
 }
 
+/// One entry in the tamper-evident frame log — what the viewer's log panel
+/// renders. Each frame's hash chains to the next, so the list IS the integrity
+/// proof: altering any frame changes its hash and every hash after it.
+pub struct FrameEntry {
+    pub seq: u64,
+    /// "SessionStart" | "PtyOutput" | "Resize" | "InputMeta" | "SessionEnd".
+    pub kind: String,
+    /// Seconds since capture start.
+    pub at_secs: f64,
+    /// This frame's hash (hex) — chains to the next frame's prev_hash.
+    pub hash_hex: String,
+    /// Payload byte length.
+    pub bytes: usize,
+}
+
+/// Verify the chain and return the per-frame log (seq, kind, time, hash, size).
+/// Fail-closed: a tampered/truncated file returns `Err` and no partial log.
+pub fn frame_log<R: Read>(apcap: R) -> Result<Vec<FrameEntry>, ReplayError> {
+    let mut base: Option<u64> = None;
+    let mut out = Vec::new();
+    verify(apcap, |f| {
+        if base.is_none() {
+            base = Some(f.mono_ns);
+        }
+        let at = (f.mono_ns.saturating_sub(base.unwrap())) as f64 / 1e9;
+        let kind = match f.frame_type {
+            FrameType::SessionStart => "SessionStart",
+            FrameType::PtyOutput => "PtyOutput",
+            FrameType::Resize => "Resize",
+            FrameType::InputMeta => "InputMeta",
+            FrameType::SessionEnd => "SessionEnd",
+        };
+        let mut hex = String::with_capacity(64);
+        for b in f.frame_hash {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
+        out.push(FrameEntry {
+            seq: f.seq,
+            kind: kind.to_string(),
+            at_secs: at,
+            hash_hex: hex,
+            bytes: f.payload.len(),
+        });
+    })?;
+    Ok(out)
+}
+
 /// Export asciicast for only the frames whose `mono_ns` falls in `[start_ns, end_ns)`.
 ///
 /// The **entire** chain is verified first. A tampered file returns `Err` without

@@ -468,25 +468,36 @@ fn cmd_cast(argv: &[String]) {
 // ---------------------------------------------------------------------------
 
 fn cmd_view(argv: &[String]) {
-    let (pin, allow_unsigned, rest) = split_auth_flags(&argv[1..]);
-    let path = match rest.first() {
+    let (_pin, _allow, rest) = split_auth_flags(&argv[1..]);
+    // The viewer is the original two-tab flight-recorder UI (viewer.html), which
+    // is a matched pair with the Go viewer: it wants /chain (the semantic event
+    // chain) + /cast (the real recording) tokenless. The Rust shim already
+    // produces both in the session dir, so `view` hands the session's chain.jsonl
+    // to that viewer. We locate the chain, not the apcap.
+    let apcap = match rest.first() {
         Some(p) => PathBuf::from(p),
         None => match install::latest_apcap() {
             Some(p) => p,
             None => {
-                eprintln!("agentprov: view [--pubkey <hex>] [--allow-unsigned] [<path>]");
+                eprintln!("agentprov: view [<session-dir-or-chain.jsonl>]");
                 eprintln!("  (no path given and no recorded sessions found)");
                 process::exit(2);
             }
         },
     };
-    // Authenticate the signed tip BEFORE serving — the viewer must agree with
-    // `verify`, not just the keyless chain. A re-forged capture is refused here.
-    gate_or_exit(&path, pin, allow_unsigned);
-    // serve() binds, prints the URL, and blocks. We open the browser to that URL
-    // a moment after it binds so the user doesn't copy/paste (and risk grabbing a
-    // stale viewer's URL). serve() owns the URL print; we add nothing else.
-    if let Err(e) = agentprov_viewer::serve_and_open(path) {
+    // From an apcap path, the chain.jsonl sits beside it.
+    let chain = if apcap.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        apcap.clone()
+    } else {
+        apcap.with_file_name("chain.jsonl")
+    };
+    if !chain.exists() {
+        eprintln!("agentprov: no chain.jsonl for this session at {}", chain.display());
+        eprintln!("  (the session was recorded but its transcript chain wasn't built —");
+        eprintln!("   only sessions captured through the installed shim have one.)");
+        process::exit(1);
+    }
+    if let Err(e) = install::launch_flight_recorder(&chain) {
         eprintln!("agentprov: viewer failed: {e}");
         process::exit(1);
     }
@@ -631,6 +642,19 @@ fn main() {
         // session and exits with claude's exit code.
         Some("__shim") => process::exit(install::shim(&argv[2..])),
         Some("sessions") => { install::list_sessions(); process::exit(0); }
+        // Build a signed semantic chain.jsonl from a transcript into <out-dir>.
+        // `chain <transcript.jsonl> <out-dir> [<cast>]`
+        Some("chain") => {
+            let (t, d) = match (argv.get(2), argv.get(3)) {
+                (Some(t), Some(d)) => (PathBuf::from(t), PathBuf::from(d)),
+                _ => { eprintln!("agentprov: chain <transcript.jsonl> <out-dir> [<cast>]"); process::exit(2); }
+            };
+            let cast = argv.get(4).map(PathBuf::from);
+            match agentprov_chain::record_transcript_with_cast(&t, &d, cast.as_deref()) {
+                Ok(n) => { eprintln!("agentprov: wrote {n} chain nodes to {}/chain.jsonl", d.display()); process::exit(0); }
+                Err(e) => { eprintln!("agentprov: chain build failed: {e}"); process::exit(1); }
+            }
+        }
         Some("help") => {
             usage();
             process::exit(0);
