@@ -325,6 +325,125 @@ fn cmd_verify(argv: &[String]) {
 }
 
 // ---------------------------------------------------------------------------
+// Subcommand: cast  (APCAP -> asciicast v2 on stdout; chain-verified)
+// ---------------------------------------------------------------------------
+
+fn cmd_cast(argv: &[String]) {
+    let path = match argv.get(1) {
+        Some(p) => PathBuf::from(p),
+        None => {
+            eprintln!("agentprov-rs: cast requires a path argument");
+            process::exit(2);
+        }
+    };
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("agentprov-rs: cannot open {path:?}: {e}");
+            process::exit(1);
+        }
+    };
+    let stdout = std::io::stdout();
+    match agentprov_replay_core::to_asciicast(BufReader::new(file), stdout.lock()) {
+        Ok(_) => process::exit(0),
+        Err(e) => {
+            eprintln!("agentprov-rs: cast failed (capture may be tampered): {e}");
+            process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand: view  (serve the capture in a hardened loopback viewer)
+// ---------------------------------------------------------------------------
+
+fn cmd_view(argv: &[String]) {
+    let path = match argv.get(1) {
+        Some(p) => PathBuf::from(p),
+        None => {
+            eprintln!("agentprov-rs: view requires a path argument");
+            process::exit(2);
+        }
+    };
+    // serve() verifies the chain at startup and serves an error page if it fails;
+    // it prints the loopback URL (with token) to stderr and blocks.
+    if let Err(e) = agentprov_viewer::serve(path) {
+        eprintln!("agentprov-rs: viewer failed: {e}");
+        process::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand: export  (APCAP -> gif/mp4 via agg/ffmpeg; chain-verified)
+// ---------------------------------------------------------------------------
+
+fn cmd_export(argv: &[String]) {
+    // export <gif|mp4> <apcap> <out>
+    let (fmt, apcap, out) = match (argv.get(1), argv.get(2), argv.get(3)) {
+        (Some(f), Some(a), Some(o)) => (f.as_str(), PathBuf::from(a), PathBuf::from(o)),
+        _ => {
+            eprintln!("agentprov-rs: export <gif|mp4> <apcap> <out>");
+            process::exit(2);
+        }
+    };
+    let format = match fmt {
+        "gif" => agentprov_export::Format::Gif,
+        "mp4" => agentprov_export::Format::Mp4,
+        other => {
+            eprintln!("agentprov-rs: export format must be gif or mp4, got `{other}`");
+            process::exit(2);
+        }
+    };
+    match agentprov_export::render(&apcap, &out, format) {
+        Ok(()) => {
+            eprintln!("agentprov-rs: rendered {} -> {}", apcap.display(), out.display());
+            process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("agentprov-rs: export failed: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand: flows  (normalize agentsnitch events -> flows.jsonl overlay)
+// ---------------------------------------------------------------------------
+
+fn cmd_flows(argv: &[String]) {
+    // flows <agentsnitch-events.jsonl> [out-dir]
+    let events = match argv.get(1) {
+        Some(p) => PathBuf::from(p),
+        None => {
+            eprintln!("agentprov-rs: flows <events.jsonl> [out-dir]");
+            process::exit(2);
+        }
+    };
+    let file = match std::fs::File::open(&events) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("agentprov-rs: cannot open {events:?}: {e}");
+            process::exit(1);
+        }
+    };
+    let flows = agentprov_collectors::parse_flows(BufReader::new(file));
+    eprintln!("agentprov-rs: normalized {} outbound flow(s)", flows.len());
+    if let Some(dir) = argv.get(2) {
+        use agentprov_collectors::EvidenceSink;
+        let mut sink = agentprov_collectors::LocalDirectorySink::new(PathBuf::from(dir));
+        if let Err(e) = sink.write_flows(&flows).and_then(|()| sink.finalize()) {
+            eprintln!("agentprov-rs: writing overlay failed: {e}");
+            process::exit(1);
+        }
+        eprintln!("agentprov-rs: wrote flows.jsonl + flows.hash to {dir}");
+    } else {
+        // No out-dir: print the hash so the overlay can be committed to the chain.
+        println!("overlay_hash: {}", agentprov_collectors::overlay_hash(&flows));
+    }
+    process::exit(0);
+}
+
+// ---------------------------------------------------------------------------
 // Help / usage
 // ---------------------------------------------------------------------------
 
@@ -340,6 +459,18 @@ fn usage() {
     eprintln!("      Trust anchor: --pubkey (out-of-band) > machine keychain.");
     eprintln!("      The bundled .pub is never trusted on its own.");
     eprintln!();
+    eprintln!("  agentprov-rs cast <path>");
+    eprintln!("      Convert a (verified) APCAP to asciicast v2 on stdout.");
+    eprintln!();
+    eprintln!("  agentprov-rs view <path>");
+    eprintln!("      Serve the capture in a hardened loopback viewer (prints the URL).");
+    eprintln!();
+    eprintln!("  agentprov-rs export <gif|mp4> <apcap> <out>");
+    eprintln!("      Render the capture to gif/mp4 (needs agg, and ffmpeg for mp4).");
+    eprintln!();
+    eprintln!("  agentprov-rs flows <events.jsonl> [out-dir]");
+    eprintln!("      Normalize agentsnitch network events into a flow overlay.");
+    eprintln!();
     eprintln!("  agentprov-rs help");
     eprintln!("      Show this message.");
 }
@@ -354,6 +485,10 @@ fn main() {
     match argv.get(1).map(String::as_str) {
         Some("run") => cmd_run(&argv[1..]),
         Some("verify") => cmd_verify(&argv[1..]),
+        Some("cast") => cmd_cast(&argv[1..]),
+        Some("view") => cmd_view(&argv[1..]),
+        Some("export") => cmd_export(&argv[1..]),
+        Some("flows") => cmd_flows(&argv[1..]),
         Some("help") => {
             usage();
             process::exit(0);

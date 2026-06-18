@@ -1,0 +1,8 @@
+[package]
+name = "agentprov-replay-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentprov-capture-format = { path = "../agentprov-capture-format" }

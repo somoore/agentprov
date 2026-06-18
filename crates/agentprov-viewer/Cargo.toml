@@ -1,0 +1,15 @@
+[package]
+name = "agentprov-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Tier-2 viewer. Loopback-only HTTP server hand-rolled on std::net (no axum/hyper
+# — a read-only localhost server for one file doesn't need an async stack). Deps
+# kept minimal on purpose; the security rules (CSP, token, no remote assets) are
+# easier to audit without a framework.
+[dependencies]
+agentprov-replay-core = { path = "../agentprov-replay-core" }
+agentprov-capture-format = { path = "../agentprov-capture-format" }
+agentprov-integrity = { path = "../agentprov-integrity" }
+getrandom = "0.2"

@@ -1,0 +1,18 @@
+[package]
+name = "agentprov-collectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Tier-2: outside the trusted capture path, so deps are fine here (the doc says
+# so explicitly). serde_json for the agentsnitch event stream — hand-parsing
+# nested JSON would be a bug farm. The trusted crates stay serde-free.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = { workspace = true }
+agentprov-capture-format = { path = "../agentprov-capture-format" }
+agentprov-integrity = { path = "../agentprov-integrity" }
+
+[dev-dependencies]
+tempfile = "3"

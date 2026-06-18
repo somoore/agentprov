@@ -1,0 +1,13 @@
+[package]
+name = "agentprov-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Tier-2, lowest priority. Shells out to agg + ffmpeg (like the Go version) to
+# render GIF/MP4 from an exported asciicast — no in-process video codec dep.
+[dependencies]
+agentprov-replay-core = { path = "../agentprov-replay-core" }
+
+[dev-dependencies]
+agentprov-capture-format = { path = "../agentprov-capture-format" }
