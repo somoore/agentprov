@@ -11,12 +11,18 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SHIM_MARKER: &str = "# agentprov-claude-shim";
+// Distinct from the Go recorder's `# agentprov-claude-shim` marker so we can
+// tell OUR shim apart from a stale Go one and replace it instead of no-op'ing.
+const SHIM_MARKER: &str = "# agentprov-rs-claude-shim";
+// Any agentprov shim (Go or Rust) contains this substring — used to detect a
+// foreign/old shim we should replace.
+const ANY_SHIM_MARKER: &str = "agentprov";
 
 struct ClaudeState {
     path_name: PathBuf,  // the file on PATH the user invokes
     real_saved: PathBuf, // where we save the original: <path>.agentprov-real
-    is_shim: bool,       // path_name is already our shim
+    is_our_shim: bool,   // path_name is already OUR (rust) shim
+    is_any_shim: bool,   // path_name is some agentprov shim (incl. a stale Go one)
 }
 
 fn inspect_claude() -> Result<ClaudeState, String> {
@@ -34,10 +40,13 @@ fn inspect_claude() -> Result<ClaudeState, String> {
     real_saved.push(".agentprov-real");
     let real_saved = PathBuf::from(real_saved);
 
-    let is_shim = std::fs::read_to_string(&path_name)
-        .map(|d| d.contains(SHIM_MARKER))
-        .unwrap_or(false);
-    Ok(ClaudeState { path_name, real_saved, is_shim })
+    let contents = std::fs::read_to_string(&path_name).unwrap_or_default();
+    // A shim is a small shell script; the real claude is a binary/symlink that
+    // won't read as a script containing our marker. is_any_shim catches a stale
+    // Go shim (whose marker line mentions "agentprov ... shim").
+    let is_our_shim = contents.contains(SHIM_MARKER);
+    let is_any_shim = contents.contains(ANY_SHIM_MARKER) && contents.contains("claude-shim");
+    Ok(ClaudeState { path_name, real_saved, is_our_shim, is_any_shim })
 }
 
 fn self_path() -> Result<PathBuf, String> {
@@ -63,10 +72,27 @@ fn shim_script(agentprov: &Path, real_claude: &Path) -> String {
 
 pub fn install() -> Result<(), String> {
     let st = inspect_claude()?;
-    if st.is_shim {
-        println!("agentprov: claude is already wrapped — auto-recording is active.");
-        println!("  (run 'agentprov-rs uninstall' to remove it.)");
-        return Ok(());
+    if st.is_our_shim {
+        // Already our shim — refresh it so it points at the current binary path
+        // (e.g. after the binary moved), but report it as already-active.
+        println!("agentprov-rs: claude is already wrapped by agentprov-rs.");
+        println!("  (refreshing the shim to the current binary path.)");
+    } else if st.is_any_shim {
+        // A FOREIGN shim (e.g. a stale Go agentprov). The real claude lives in
+        // its .agentprov-real, NOT in the shim file. Restore it, then re-shim.
+        println!("agentprov-rs: found a non-agentprov-rs shim — replacing it.");
+        if std::fs::symlink_metadata(&st.real_saved).is_ok() {
+            // remove the foreign shim, restore the real claude it saved.
+            std::fs::remove_file(&st.path_name)
+                .map_err(|e| format!("could not remove foreign shim: {e}"))?;
+            std::fs::rename(&st.real_saved, &st.path_name)
+                .map_err(|e| format!("could not restore real claude from {}: {e}", st.real_saved.display()))?;
+        } else {
+            return Err(format!(
+                "found a foreign shim at {} but no saved real claude at {} — refusing to touch it; uninstall the other recorder first",
+                st.path_name.display(), st.real_saved.display()
+            ));
+        }
     }
     let self_exe = self_path()?;
 
@@ -92,8 +118,8 @@ pub fn install() -> Result<(), String> {
 
 pub fn uninstall() -> Result<(), String> {
     let st = inspect_claude()?;
-    if !st.is_shim {
-        println!("agentprov: claude is not wrapped — nothing to uninstall.");
+    if !st.is_our_shim {
+        println!("agentprov: claude is not wrapped by agentprov-rs — nothing to uninstall.");
         // Still offer to clean a stale saved-original left by a prior install.
         if std::fs::symlink_metadata(&st.real_saved).is_ok() {
             println!("  note: a stale {} exists; remove it manually if unwanted.", st.real_saved.display());
