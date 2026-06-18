@@ -1,0 +1,12 @@
+[package]
+name = "agentprov-integrity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Tier-0 trusted path. ed25519-dalek is the one crypto dep; rand_core for the
+# ephemeral-fallback keygen. Keychain access reuses the macOS `security` CLI
+# (same as the Go version) — no extra dependency for the OS-bound key path.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }

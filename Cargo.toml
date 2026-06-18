@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/agentprov-pty-core",
     "crates/agentprov-capture-format",
+    "crates/agentprov-integrity",
     "crates/agentprov-cli",
 ]
 

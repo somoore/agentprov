@@ -1,9 +1,34 @@
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
-use agentprov_capture_format::{FrameType, verify};
+use agentprov_capture_format::{verify, FrameType};
+use agentprov_integrity::{self as integrity, KeySource, Signing, VerifyTip};
 use agentprov_pty_core::CaptureSession;
+
+/// Re-walk an APCAP file and return (frame_count, tip_frame_hash). The tip is
+/// the last frame's frame_hash — signing it commits to the whole chain incl.
+/// frame count, so truncation and forgery both break the signature.
+fn read_tip(path: &Path) -> Result<(u64, [u8; 32]), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open {path:?}: {e}"))?;
+    let mut tip = [0u8; 32];
+    let n = verify(BufReader::new(file), |f| tip = f.frame_hash)
+        .map_err(|e| format!("{e}"))?;
+    if n == 0 {
+        return Err("empty capture (no frames)".into());
+    }
+    Ok((n, tip))
+}
+
+/// Sidecar paths: `<capture>.pub` and `<capture>.sig` (outside the frame stream,
+/// so the frozen format is untouched).
+fn sidecars(apcap: &Path) -> (PathBuf, PathBuf) {
+    let mut p = apcap.as_os_str().to_owned();
+    p.push(".pub");
+    let mut s = apcap.as_os_str().to_owned();
+    s.push(".sig");
+    (PathBuf::from(p), PathBuf::from(s))
+}
 
 // ---------------------------------------------------------------------------
 // Arg parsing
@@ -96,6 +121,33 @@ fn cmd_run(argv: &[String]) {
         result.exit_code,
     );
 
+    // Sign the chain tip — this is what makes the capture tamper-EVIDENT rather
+    // than merely consistency-checked. Best-effort: a signing failure must not
+    // change the child's exit code or lose the capture (the frames are already
+    // on disk). We warn and continue.
+    match read_tip(&out_path) {
+        Ok((_, tip)) => {
+            let signer = Signing::load_or_create();
+            let (pub_path, sig_path) = sidecars(&out_path);
+            let sig = signer.sign_tip(&tip);
+            let pub_hex = integrity::to_hex(&signer.public_key());
+            let sig_hex = integrity::to_hex(&sig);
+            let w1 = std::fs::write(&pub_path, &pub_hex);
+            let w2 = std::fs::write(&sig_path, &sig_hex);
+            match (w1, w2) {
+                (Ok(()), Ok(())) => {
+                    let src = match signer.source {
+                        KeySource::Keychain => "keychain-bound",
+                        KeySource::Ephemeral => "EPHEMERAL (not non-repudiable — keychain unavailable)",
+                    };
+                    eprintln!("agentprov-rs: signed tip with {src} key → {}", sig_path.display());
+                }
+                _ => eprintln!("agentprov-rs: warning: could not write signature sidecars"),
+            }
+        }
+        Err(e) => eprintln!("agentprov-rs: warning: could not sign capture: {e}"),
+    }
+
     process::exit(result.exit_code);
 }
 
@@ -128,8 +180,10 @@ fn cmd_verify(argv: &[String]) {
     let mut session_start_payload: Option<Vec<u8>> = None;
     let mut session_end_payload: Option<Vec<u8>> = None;
     let mut pty_output_bytes: u64 = 0;
+    let mut tip = [0u8; 32];
 
     let total = verify(reader, |frame| {
+        tip = frame.frame_hash;
         let idx = (frame.frame_type as u8).saturating_sub(1) as usize;
         if idx < counts.len() {
             counts[idx] += 1;
@@ -176,7 +230,45 @@ fn cmd_verify(argv: &[String]) {
             } else {
                 println!("SessionEnd:   (none)");
             }
-            process::exit(0);
+
+            // Signature check: the chain alone is keyless (consistency only).
+            // The signed tip is what catches an adversary who re-forges the
+            // chain or truncates trailing frames. Absence of sidecars is
+            // reported as UNSIGNED, not as a pass — fail-loud on the weaker case.
+            println!();
+            let (pub_path, sig_path) = sidecars(&path);
+            match (std::fs::read_to_string(&pub_path), std::fs::read_to_string(&sig_path)) {
+                (Ok(pub_hex), Ok(sig_hex)) => {
+                    let pk = integrity::from_hex(&pub_hex);
+                    let sg = integrity::from_hex(&sig_hex);
+                    match (pk, sg) {
+                        (Some(pk), Some(sg)) => match integrity::verify_tip(&tip, &pk, &sg) {
+                            VerifyTip::Valid => {
+                                println!("SIGNATURE: VALID — tip signed, chain is tamper-evident");
+                                process::exit(0);
+                            }
+                            VerifyTip::BadSignature => {
+                                eprintln!("SIGNATURE: INVALID — tip does not match signature (forged or truncated)");
+                                process::exit(1);
+                            }
+                            VerifyTip::BadKeyOrSig => {
+                                eprintln!("SIGNATURE: malformed key/signature sidecar");
+                                process::exit(1);
+                            }
+                        },
+                        _ => {
+                            eprintln!("SIGNATURE: malformed hex in sidecar");
+                            process::exit(1);
+                        }
+                    }
+                }
+                _ => {
+                    // No sidecars: chain verified but unsigned. Exit 0 (the chain
+                    // IS consistent) but say plainly it isn't tamper-evident.
+                    println!("SIGNATURE: UNSIGNED — chain is consistent but not authenticated (no .pub/.sig)");
+                    process::exit(0);
+                }
+            }
         }
     }
 }

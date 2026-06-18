@@ -11,3 +11,4 @@ path = "src/main.rs"
 [dependencies]
 agentprov-capture-format = { path = "../agentprov-capture-format" }
 agentprov-pty-core = { path = "../agentprov-pty-core" }
+agentprov-integrity = { path = "../agentprov-integrity" }

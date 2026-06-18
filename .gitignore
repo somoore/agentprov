@@ -8,6 +8,9 @@
 # recorder artifacts
 chain.jsonl
 chain.pub
+*.apcap
+*.apcap.pub
+*.apcap.sig
 *.chain.jsonl
 
 # os
