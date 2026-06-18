@@ -876,9 +876,8 @@ mod tests {
         let prev = "GENESIS";
 
         // Hand-built reference string: seq, then NUL-joined fields, then sorted attrs.
-        let expect_input = format!(
-            "7\u{0}GENESIS\u{0}tool_call\u{0}main\u{0}sp1\u{0}sp0\u{0}mcp__fs__read\u{0}trusted\u{0}tool_use mcp__fs__read\u{0}hello\u{0}\u{0}2026-01-01T00:00:00Z\u{0}mcp=fs"
-        );
+        let expect_input =
+            "7\u{0}GENESIS\u{0}tool_call\u{0}main\u{0}sp1\u{0}sp0\u{0}mcp__fs__read\u{0}trusted\u{0}tool_use mcp__fs__read\u{0}hello\u{0}\u{0}2026-01-01T00:00:00Z\u{0}mcp=fs";
         let mut h = Sha256::new();
         h.update(expect_input.as_bytes());
         let expect = to_hex(&h.finalize());

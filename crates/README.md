@@ -58,6 +58,41 @@ agentprov-rs flows  events.jsonl flows/                  # agentsnitch overlay
 `cast`/`view`/`export` refuse a forged or unauthenticated capture; pass
 `--allow-unsigned` to downgrade unsigned/untrusted to a warning.
 
+## Library use
+
+The trusted core is library-first — every API takes `Read`/`Write`, not paths,
+so you can feed a file, a socket, or an in-memory buffer. Capture a command,
+then verify and re-walk the signed chain:
+
+```rust
+use agentprov_pty_core::CaptureSession;
+use agentprov_capture_format::{verify, FrameType};
+use agentprov_integrity::{Signing, to_hex};
+use std::path::PathBuf;
+
+// 1. Capture a child under a PTY into an APCAP file.
+let out = PathBuf::from("session.apcap");
+let result = CaptureSession::new("echo".into(), vec!["hi".into()], out.clone()).run()?;
+println!("captured {} frames, exit {}", result.frames_written, result.exit_code);
+
+// 2. Verify the hash chain and grab the tip (last frame's hash).
+let mut tip = [0u8; 32];
+let bytes = std::fs::read(&out)?;
+verify(&bytes[..], |f| {
+    tip = f.frame_hash;
+    if f.frame_type == FrameType::PtyOutput { /* … */ }
+})?; // Err on any tamper/truncation — fail-closed
+
+// 3. Sign the tip with a keychain-bound ed25519 key → tamper-evidence.
+let signer = Signing::load_or_create();
+std::fs::write("session.apcap.sig", to_hex(&signer.sign_tip(&tip)))?;
+std::fs::write("session.apcap.pub", to_hex(&signer.public_key()))?;
+```
+
+`agentprov-replay-core` turns the same APCAP into asciicast v2
+(`to_asciicast`), a summary (`summarize`), or a per-frame audit log
+(`frame_log`) — all chain-verified first.
+
 ## Known limitations (honest, in-code)
 
 - **Keychain is defense-in-depth, not airtight.** The macOS keychain ACL trusts

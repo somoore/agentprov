@@ -233,6 +233,9 @@ pub fn verify<R: Read>(mut r: R, mut each: impl FnMut(&Frame)) -> Result<u64, Ve
             return Err(VerifyError::BadVersion(seq));
         }
         let frame_type = FrameType::from_u8(header[5]).ok_or(VerifyError::BadType(seq))?;
+        // `header` is a fixed-size buffer filled by read_exact above; every
+        // `header[a..b].try_into()` below converts a constant-width slice into a
+        // constant-width array, so the unwraps are infallible (not input-dependent).
         let got_seq = u64::from_le_bytes(header[6..14].try_into().unwrap());
         if got_seq != expected_seq {
             return Err(VerifyError::SeqGap { expected: expected_seq, got: got_seq });

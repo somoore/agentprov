@@ -1,6 +1,12 @@
 [package]
 name = "agentprov-integrity"
 version.workspace = true
+description = "ed25519 signing of a capture's chain tip, with macOS-keychain-bound keys — turns a hash chain into tamper evidence."
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
 

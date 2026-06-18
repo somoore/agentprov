@@ -1,6 +1,12 @@
 [package]
 name = "agentprov-collectors"
 version.workspace = true
+description = "Normalize agentsnitch OS-observed network flows into a trust-labeled evidence overlay."
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
 

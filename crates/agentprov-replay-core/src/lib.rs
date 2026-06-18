@@ -322,6 +322,7 @@ pub fn frame_log<R: Read>(apcap: R) -> Result<Vec<FrameEntry>, ReplayError> {
         if base.is_none() {
             base = Some(f.mono_ns);
         }
+        // base is Some by the line above on every iteration — unwrap is infallible.
         let at = (f.mono_ns.saturating_sub(base.unwrap())) as f64 / 1e9;
         let kind = match f.frame_type {
             FrameType::SessionStart => "SessionStart",

@@ -1,6 +1,12 @@
 [package]
 name = "agentprov-export"
 version.workspace = true
+description = "Render a captured session to GIF/MP4 via agg + ffmpeg, from a sanitized copy of the recording."
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
 

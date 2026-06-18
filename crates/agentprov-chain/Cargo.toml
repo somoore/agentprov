@@ -1,6 +1,12 @@
 [package]
 name = "agentprov-chain"
 version.workspace = true
+description = "Build a signed semantic provenance chain (prompt/tool-call/result events) from an AI coding-agent transcript."
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
 

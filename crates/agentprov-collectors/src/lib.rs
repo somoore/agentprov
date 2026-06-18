@@ -376,7 +376,7 @@ this is not valid json at all {{{garbage
         let file = std::fs::File::open(&jsonl_path).expect("flows.jsonl");
         let recovered: Vec<Flow> = BufReader::new(file)
             .lines()
-            .filter_map(|l| l.ok())
+            .map_while(Result::ok)
             .filter(|l| !l.trim().is_empty())
             .map(|l| serde_json::from_str(&l).expect("valid Flow JSON"))
             .collect();

@@ -16,6 +16,12 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+authors = ["Scott Moore"]
+repository = "https://github.com/somoore/agentprov"
+homepage = "https://github.com/somoore/agentprov"
+keywords = ["pty", "tamper-evident", "provenance", "audit", "security"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.87"
 
 # ponytail: tier-0 deps pinned here so the trusted path stays auditable.
 # sha2 = frame hash (matches the Go chain's sha256). rustix = thin syscall layer
