@@ -1,3 +1,5 @@
+mod install;
+
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -200,37 +202,40 @@ fn cmd_run(argv: &[String]) {
             process::exit(2);
         }
     };
-
-    let out_path = run_args.out.clone();
-    let session = CaptureSession::new(run_args.command, run_args.args, run_args.out);
-    let result = match session.run() {
-        Ok(r) => r,
+    match capture_and_sign(&run_args.command, &run_args.args, &run_args.out) {
+        Ok(code) => process::exit(code),
         Err(e) => {
             eprintln!("agentprov-rs: failed to run capture session: {e}");
             process::exit(1);
         }
-    };
+    }
+}
+
+/// Capture `command` under a PTY into `out`, then sign the chain tip. Returns the
+/// child's exit code. Used by both `run` and the install shim. Signing is
+/// best-effort — a signing failure never changes the child's exit code or loses
+/// the capture (the frames are already on disk). Returns Err only if the PTY
+/// capture itself couldn't start.
+pub(crate) fn capture_and_sign(
+    command: &Path,
+    args: &[String],
+    out: &Path,
+) -> Result<i32, String> {
+    let session = CaptureSession::new(command.to_path_buf(), args.to_vec(), out.to_path_buf());
+    let result = session.run().map_err(|e| e.to_string())?;
 
     eprintln!(
         "agentprov-rs: captured {} frames to {} (exit {})",
-        result.frames_written,
-        out_path.display(),
-        result.exit_code,
+        result.frames_written, out.display(), result.exit_code,
     );
 
-    // Sign the chain tip — this is what makes the capture tamper-EVIDENT rather
-    // than merely consistency-checked. Best-effort: a signing failure must not
-    // change the child's exit code or lose the capture (the frames are already
-    // on disk). We warn and continue.
-    match read_tip(&out_path) {
+    match read_tip(out) {
         Ok((_, tip)) => {
             let signer = Signing::load_or_create();
-            let (pub_path, sig_path) = sidecars(&out_path);
+            let (pub_path, sig_path) = sidecars(out);
             let sig = signer.sign_tip(&tip);
-            let pub_hex = integrity::to_hex(&signer.public_key());
-            let sig_hex = integrity::to_hex(&sig);
-            let w1 = std::fs::write(&pub_path, &pub_hex);
-            let w2 = std::fs::write(&sig_path, &sig_hex);
+            let w1 = std::fs::write(&pub_path, integrity::to_hex(&signer.public_key()));
+            let w2 = std::fs::write(&sig_path, integrity::to_hex(&sig));
             match (w1, w2) {
                 (Ok(()), Ok(())) => {
                     let src = match signer.source {
@@ -244,8 +249,7 @@ fn cmd_run(argv: &[String]) {
         }
         Err(e) => eprintln!("agentprov-rs: warning: could not sign capture: {e}"),
     }
-
-    process::exit(result.exit_code);
+    Ok(result.exit_code)
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +585,12 @@ fn usage() {
     eprintln!("  agentprov-rs flows <events.jsonl> [out-dir]");
     eprintln!("      Normalize agentsnitch network events into a flow overlay.");
     eprintln!();
+    eprintln!("  agentprov-rs install | uninstall");
+    eprintln!("      Shim (or un-shim) claude on PATH so every session is auto-recorded.");
+    eprintln!();
+    eprintln!("  agentprov-rs sessions");
+    eprintln!("      List auto-recorded sessions under ~/.agentprov/sessions/.");
+    eprintln!();
     eprintln!("  agentprov-rs help");
     eprintln!("      Show this message.");
 }
@@ -599,6 +609,18 @@ fn main() {
         Some("view") => cmd_view(&argv[1..]),
         Some("export") => cmd_export(&argv[1..]),
         Some("flows") => cmd_flows(&argv[1..]),
+        Some("install") => match install::install() {
+            Ok(()) => process::exit(0),
+            Err(e) => { eprintln!("agentprov-rs: install failed: {e}"); process::exit(1); }
+        },
+        Some("uninstall") => match install::uninstall() {
+            Ok(()) => process::exit(0),
+            Err(e) => { eprintln!("agentprov-rs: uninstall failed: {e}"); process::exit(1); }
+        },
+        // __shim is the runtime entry the installed shim execs; it records the
+        // session and exits with claude's exit code.
+        Some("__shim") => process::exit(install::shim(&argv[2..])),
+        Some("sessions") => { install::list_sessions(); process::exit(0); }
         Some("help") => {
             usage();
             process::exit(0);
