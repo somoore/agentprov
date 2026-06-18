@@ -109,11 +109,11 @@ pub fn verify_tip(tip: &[u8; 32], pub_bytes: &[u8], sig_bytes: &[u8]) -> VerifyT
 }
 
 pub fn to_hex(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
-    for byte in b {
-        s.push_str(&format!("{byte:02x}"));
-    }
-    s
+    use std::fmt::Write as _;
+    b.iter().fold(String::with_capacity(b.len() * 2), |mut s, byte| {
+        let _ = write!(s, "{byte:02x}");
+        s
+    })
 }
 
 pub fn from_hex(s: &str) -> Option<Vec<u8>> {

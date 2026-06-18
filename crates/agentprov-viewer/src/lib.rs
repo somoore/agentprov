@@ -46,35 +46,6 @@ const FONT_TTF: &[u8] = include_bytes!(concat!(
     "/../../web/font/JetBrainsMono-Regular.ttf"
 ));
 
-// ── error ────────────────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-pub enum ViewerError {
-    Io(io::Error),
-    Replay(agentprov_replay_core::ReplayError),
-}
-
-impl std::fmt::Display for ViewerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "io: {e}"),
-            Self::Replay(e) => write!(f, "replay: {e}"),
-        }
-    }
-}
-
-impl From<io::Error> for ViewerError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-impl From<agentprov_replay_core::ReplayError> for ViewerError {
-    fn from(e: agentprov_replay_core::ReplayError) -> Self {
-        Self::Replay(e)
-    }
-}
-
 // ── token generation ─────────────────────────────────────────────────────────
 
 /// Generate a 128-bit random token encoded as 32 lowercase hex chars.
@@ -82,11 +53,7 @@ impl From<agentprov_replay_core::ReplayError> for ViewerError {
 pub fn gen_token() -> String {
     let mut bytes = [0u8; 16]; // 128 bits
     getrandom::getrandom(&mut bytes).expect("getrandom failed");
-    bytes.iter().fold(String::with_capacity(32), |mut s, b| {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    agentprov_integrity::to_hex(&bytes)
 }
 
 // ── routing ───────────────────────────────────────────────────────────────────
@@ -365,7 +332,7 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn new(apcap_path: &PathBuf) -> Result<Self, ViewerError> {
+    fn new(apcap_path: &PathBuf) -> io::Result<Self> {
         let token = gen_token();
 
         // Read the APCAP file once.
@@ -378,7 +345,8 @@ impl ServerState {
             Ok(summary) => {
                 // Generate verified asciicast.
                 let mut cast_buf = Vec::new();
-                to_asciicast(&apcap_bytes[..], &mut cast_buf)?;
+                to_asciicast(&apcap_bytes[..], &mut cast_buf)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
 
                 let idx = index_html(&summary, &token);
                 Ok(Self {
@@ -492,7 +460,7 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) {
 /// If the APCAP fails verification, still binds and serves an error page —
 /// the URL is printed so the caller can open it and see the failure reason.
 pub fn serve(apcap_path: PathBuf) -> io::Result<()> {
-    let state = ServerState::new(&apcap_path).map_err(|e| io::Error::other(e.to_string()))?;
+    let state = ServerState::new(&apcap_path)?;
     let state = Arc::new(state);
 
     // Bind on loopback with OS-assigned port. NEVER 0.0.0.0.
