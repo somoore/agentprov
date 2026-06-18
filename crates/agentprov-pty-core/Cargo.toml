@@ -1,0 +1,10 @@
+[package]
+name = "agentprov-pty-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentprov-capture-format = { path = "../agentprov-capture-format" }
+rustix.workspace = true
+libc.workspace = true

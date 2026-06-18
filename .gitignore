@@ -1,3 +1,6 @@
+# rust workspace build output
+/target
+
 # build output — root binary only. NOT the plugin/agentprov dir (bare
 # 'agentprov' matched plugin/agentprov/ and silently dropped the whole plugin).
 /agentprov

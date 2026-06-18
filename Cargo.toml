@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agentprov-pty-core",
+    "crates/agentprov-capture-format",
+    "crates/agentprov-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# ponytail: tier-0 deps pinned here so the trusted path stays auditable.
+# sha2 = frame hash (matches the Go chain's sha256). rustix = thin syscall layer
+# for the PTY (no tokio, no portable-pty/wezterm — we own the capture semantics).
+[workspace.dependencies]
+sha2 = "0.10"
+rustix = { version = "0.38", features = ["pty", "termios", "process", "fs", "stdio"] }
+libc = "0.2"

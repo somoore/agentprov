@@ -1,0 +1,13 @@
+[package]
+name = "agentprov-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentprov-rs"
+path = "src/main.rs"
+
+[dependencies]
+agentprov-capture-format = { path = "../agentprov-capture-format" }
+agentprov-pty-core = { path = "../agentprov-pty-core" }
