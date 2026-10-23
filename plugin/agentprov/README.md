@@ -43,6 +43,10 @@ cd ../..          # repo root
 go build -o plugin/agentprov/bin/agentprov .
 ```
 
+The build auto-selects the patched toolchain pinned in `go.mod` (`toolchain go1.27.3`),
+which requires macOS 13+ (Go 1.27 dropped macOS 12). The committed `bin/agentprov`
+has the same requirement.
+
 (For fleet/MDM distribution, ship a Developer-ID-signed, notarized binary —
 ad-hoc signing only works on the building machine.)
 
