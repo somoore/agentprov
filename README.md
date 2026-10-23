@@ -153,6 +153,10 @@ agentprov drop   <chain> <seq>   demo: drop a node so verify fails
 Supported agents: Claude Code (`claude`), Codex (`codex`). macOS for the keychain-bound key;
 elsewhere it falls back to an ephemeral key and says so.
 
+Platform requirement: macOS 13 (Ventura) or newer, or Linux. Builds use the patched Go
+toolchain pinned in `go.mod` (`toolchain go1.27.3`, auto-selected by `GOTOOLCHAIN=auto`),
+and Go 1.27 dropped macOS 12 support. The committed plugin binary is built the same way.
+
 ## Status
 
 Experimental. A working proof of the thesis, not a product. No dependencies beyond the Go
