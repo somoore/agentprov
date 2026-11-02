@@ -7,11 +7,13 @@ replay/viewer/export/collectors layered on top as optional convenience.
 
 ## Trust split
 
-The thesis is **"distrust the agent; trust the chain."** That holds only because
-the trust anchor lives where the agent can't forge it:
+The thesis is **"distrust the agent; trust the chain."** That holds because
+trust is anchored out-of-band, not in the evidence bundle:
 
 - The capture is a per-frame **sha256 hash chain** (consistency).
 - The chain **tip is ed25519-signed** with a keychain-bound key (authenticity).
+  (The keychain item is readable by any same-user process, so this is
+  tamper-evident, not a boundary against same-user code execution.)
 - **The CLI authenticates the signed tip before every display surface**
   (`cast`, `view`, `export`) against a *trusted* key — the machine keychain
   on-box, or a `--pubkey` pin obtained out-of-band off-box. The bundled

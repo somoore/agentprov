@@ -126,13 +126,27 @@ pub fn to_hex(b: &[u8]) -> String {
 
 pub fn from_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if !s.len().is_multiple_of(2) {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
+    // Parse BYTES, never `&s[i..i+2]` on a &str: slicing at a non-char boundary
+    // panics, and malformed sidecars are ordinary untrusted input on the verify
+    // path. Any non-ASCII byte is simply not hex -> None.
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        out.push((hex_val(pair[0])? << 4) | hex_val(pair[1])?);
+    }
+    Some(out)
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// macOS keychain seed storage via the `security` CLI — same mechanism as the
@@ -142,7 +156,8 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
 /// dep for no behavioral gain in the trusted path.
 mod keychain {
     use super::SEED_LEN;
-    use std::process::Command;
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
 
     const SERVICE: &str = "agentprov-signing-key";
     const ACCOUNT: &str = "agentprov";
@@ -161,14 +176,28 @@ mod keychain {
     }
 
     pub fn set_seed(seed: &[u8; SEED_LEN]) -> bool {
-        Command::new("security")
-            .args([
-                "add-generic-password", "-a", ACCOUNT, "-s", SERVICE,
-                "-w", &super::to_hex(seed), "-U",
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        // Deliver the seed on stdin, never argv: argv is readable by same-user
+        // processes for the lifetime of the call.
+        let mut child = match Command::new("security")
+            .arg("-i")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let line = format!(
+                "add-generic-password -a {ACCOUNT} -s {SERVICE} -w {} -U\n",
+                super::to_hex(seed)
+            );
+            if stdin.write_all(line.as_bytes()).is_err() {
+                return false;
+            }
+        }
+        child.wait().map(|s| s.success()).unwrap_or(false)
     }
 }
 
@@ -194,6 +223,16 @@ mod tests {
         let mut forged_tip = [42u8; 32];
         forged_tip[0] ^= 0xff;
         assert_eq!(verify_tip(&forged_tip, &s.public_key(), &sig), VerifyTip::BadSignature);
+    }
+
+    #[test]
+    fn from_hex_rejects_multibyte_without_panicking() {
+        // Regression: slicing `&s[i..i+2]` panics when a UTF-8 boundary falls at
+        // an even byte offset. Malformed .pub/.sig sidecars must return None.
+        assert_eq!(from_hex("a€"), None);
+        assert_eq!(from_hex("€a"), None);
+        assert_eq!(from_hex("ab€d"), None);
+        assert_eq!(from_hex("00ff"), Some(vec![0x00, 0xff]));
     }
 
     #[test]

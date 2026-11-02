@@ -1,0 +1,12 @@
+# gitleaks configuration — extends the default rules; only allowlists build output.
+#
+# `target/` is Cargo's untracked build directory (see .gitignore). It contains
+# compiled metadata for the ed25519-dalek dependency, whose doctest constants
+# match the `private-key` rule. Those files are never committed or shipped, so
+# they are not a credential in this repository.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Cargo build output (untracked, gitignored)"
+paths = ['''^target/''']

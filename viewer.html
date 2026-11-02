@@ -221,9 +221,12 @@
     <div class="summary" id="summary"></div>
     <div class="what">
       This is a <b>tamper-evident record</b> of one AI coding-agent run. Every event is
-      hash-chained and signed by a key the agent can't reach, so the verdict above is
-      <b>proof, not a claim</b>: alter or drop any event and the chain breaks; if the agent
-      goes dark mid-run, the missing heartbeats expose the gap a plain log would hide.
+      hash-chained, and the record is signed with a key held in your keychain. Alter or drop
+      any event and the chain breaks; if the agent goes dark mid-run, the missing heartbeats
+      expose the gap a plain log would hide. This browser view checks the <b>hash chain only</b>
+      — it has no key, so it cannot verify signatures. Run <code>agentprov verify</code> for
+      the authenticated verdict. (Signing raises the bar; it is not a boundary against
+      same-user code execution.)
     </div>
 
     <div class="secthead">
@@ -312,7 +315,7 @@ async function analyze(nodes){
 const STORY=new Set(["prompt","tool_call","tool_result","assistant","subagent","image","idle_gap","resume","flow"]);
 function isPlumbing(n){ return !STORY.has(n.op) && n.op!=="heartbeat"; }
 
-function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));}
 function label(n){
   if(n.op==="prompt") return "🧑 HUMAN → agent";
   if(n.op==="assistant") return "🤖 agent";
@@ -349,7 +352,7 @@ function nodeEl(n,i,broken,why){
   const meta=`<span class="meta">${esc(shortTime(n.time))} · ${esc(shortHash(n.hash))}</span>`;
   el.innerHTML=`<div class="rail"><div class="marker"></div></div>
     <div class="body"><div class="line"><span class="op">${esc(n.op||"?")}</span>${tool}
-      <span class="txt">${tool?"":label(n)}</span>${meta}<span class="seq">#${n.seq}</span></div>${nethtml}${detailhtml}${whyhtml}</div>`;
+      <span class="txt">${tool?"":label(n)}</span>${meta}<span class="seq">#${esc(n.seq)}</span></div>${nethtml}${detailhtml}${whyhtml}</div>`;
   return el;
 }
 
@@ -370,12 +373,13 @@ async function render(text){
   const intact=res.fb<0, vd=$("#verdict");
   if(intact&&res.clean){
     vd.className="verdict good";
-    vd.innerHTML=`<div class="icon">✓</div><div><div class="vmain">Record intact</div>
-      <div class="vsub">All ${nodes.length} events verify · the agent exited cleanly · nothing was altered, dropped, or silenced.</div></div>`;
+    vd.innerHTML=`<div class="icon">✓</div><div><div class="vmain">Record internally consistent</div>
+      <div class="vsub">All ${nodes.length} events hash-chain cleanly · the agent exited cleanly · nothing was altered, dropped, or silenced.
+      Signatures are not checked in this browser view — run <code>agentprov verify</code> for the authenticated verdict.</div></div>`;
   }else if(!intact){
     vd.className="verdict bad";
     vd.innerHTML=`<div class="icon">✗</div><div><div class="vmain">Record TAMPERED</div>
-      <div class="vsub">The chain breaks at event #${nodes[res.fb].seq} — ${esc(res.why)}. This record was modified after the fact.</div></div>`;
+      <div class="vsub">The chain breaks at event #${esc(nodes[res.fb].seq)} — ${esc(res.why)}. This record was modified after the fact.</div></div>`;
   }else{
     vd.className="verdict bad";
     vd.innerHTML=`<div class="icon">⚠</div><div><div class="vmain">Record incomplete — gap detected</div>
@@ -715,7 +719,7 @@ body{margin:0;background:#0d0f12;color:#c9d1d9;font:13px/1.5 ui-monospace,Menlo,
 $("#dlVideo").onclick=async()=>{
   const btn=$("#dlVideo"); btn.disabled=true; btn.textContent="rendering video…";
   try{
-    const resp=await fetch("/video");
+    const resp=await fetch("/video",{method:"POST"});
     if(!resp.ok){
       const msg=await resp.text();
       btn.textContent="⚠ needs agg/ffmpeg on this machine";

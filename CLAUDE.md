@@ -22,9 +22,12 @@ Any change here must preserve all three — they ARE the product:
 2. **Gap detection** — the *recorder* (not the agent) emits `heartbeat` nodes on a cadence
    and a final `clean exit` heartbeat. A run that goes dark lacks the clean-exit heartbeat;
    `verify` flags it as possible evasion. A plain log would look complete; this doesn't.
-3. **Non-repudiation** — nodes are signed with an ed25519 key whose seed lives in the macOS
-   keychain (`keychainService`), unreachable by the agent process. A popped agent can't forge
-   a chain that verifies. Falls back to an ephemeral key off-macOS and *says so* in `verify`.
+3. **Signed evidence** — nodes are signed with an ed25519 key whose seed lives in the macOS
+   keychain (`keychainService`). `verify` pins to the keychain key or an explicit `--pubkey`;
+   it never trusts a `chain.pub` that sits beside the chain and fails closed when no anchor
+   exists. This is tamper-*evident*, not a boundary against same-user code execution: any
+   process running as the user can read the keychain item. Falls back to an ephemeral key
+   off-macOS and *says so* in `verify`.
 
 ## Architecture (one file: main.go)
 

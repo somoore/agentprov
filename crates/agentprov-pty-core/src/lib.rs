@@ -12,6 +12,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
@@ -83,10 +84,13 @@ impl CaptureSession {
         let _ = tcsetwinsize(&master, initial_winsize);
 
         // ── open output file + Writer ────────────────────────────────────────
+        // Captures contain the full terminal transcript (often secrets), so
+        // create them 0600 rather than inheriting the umask (typically 0644).
         let out_file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(0o600)
             .open(&self.apcap_out)?;
         let mut writer = Writer::new(out_file);
         let mut frames_written: u64 = 0;
@@ -454,6 +458,14 @@ mod tests {
         );
 
         // Read the captured file and verify the hash chain.
+        // Evidence file must not be group/world readable (regression: mode 0644).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "apcap evidence must be created 0600, got {mode:o}");
+        }
+
         let f = std::fs::File::open(&out_path).expect("output file should exist");
         let mut frames: Vec<(FT, Vec<u8>)> = Vec::new();
         let frame_count = verify(f, |frame| {

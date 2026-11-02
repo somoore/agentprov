@@ -80,27 +80,32 @@ fn authenticate(path: &Path, pinned_pub: Option<Vec<u8>>) -> Auth {
     }
 }
 
-/// Gate a content-displaying surface (cast/export) on authentication. Refuses to
-/// render an INVALID capture outright; refuses UNSIGNED/UNTRUSTED unless the
-/// caller passed `--allow-unsigned` (and then prints a loud warning). This keeps
-/// cast/export honest about what they're showing.
-fn gate_or_exit(path: &Path, pinned_pub: Option<Vec<u8>>, allow_unsigned: bool) {
+/// Gate a content-displaying surface (cast/view/export) on authentication.
+/// Refuses an INVALID capture outright; refuses UNSIGNED/UNTRUSTED unless the
+/// caller passed `--allow-unsigned` (and then prints a loud warning). Returns a
+/// Result so the decision is unit-testable instead of calling process::exit.
+fn gate(path: &Path, pinned_pub: Option<Vec<u8>>, allow_unsigned: bool) -> Result<(), String> {
     match authenticate(path, pinned_pub) {
-        Auth::Valid => {}
-        Auth::Invalid(why) => {
-            eprintln!("agentprov-rs: REFUSING — capture failed authentication: {why}");
-            process::exit(1);
-        }
+        Auth::Valid => Ok(()),
+        Auth::Invalid(why) => Err(format!("REFUSING — capture failed authentication: {why}")),
         Auth::Unsigned if allow_unsigned => {
             eprintln!("agentprov-rs: WARNING — capture is unsigned (consistency only, not authenticated)");
+            Ok(())
         }
         Auth::Untrusted if allow_unsigned => {
             eprintln!("agentprov-rs: WARNING — capture signed but no trusted key to check it");
+            Ok(())
         }
         Auth::Unsigned | Auth::Untrusted => {
-            eprintln!("agentprov-rs: REFUSING — capture is not authenticated; pass --allow-unsigned to view anyway");
-            process::exit(1);
+            Err("REFUSING — capture is not authenticated; pass --allow-unsigned to view anyway".into())
         }
+    }
+}
+
+fn gate_or_exit(path: &Path, pinned_pub: Option<Vec<u8>>, allow_unsigned: bool) {
+    if let Err(why) = gate(path, pinned_pub, allow_unsigned) {
+        eprintln!("agentprov-rs: {why}");
+        process::exit(1);
     }
 }
 
@@ -267,10 +272,12 @@ fn cmd_verify(argv: &[String]) {
     // obtained out-of-band. Without it, on-machine verify falls back to the
     // keychain key. The bundled .pub is NEVER trusted on its own.
     let mut pinned_pub: Option<Vec<u8>> = None;
+    let mut allow_unsigned = false;
     let mut path: Option<PathBuf> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
+            "--allow-unsigned" => allow_unsigned = true,
             "--pubkey" => {
                 i += 1;
                 match argv.get(i).and_then(|h| integrity::from_hex(h)) {
@@ -292,7 +299,7 @@ fn cmd_verify(argv: &[String]) {
     let path = match path.or_else(install::latest_apcap) {
         Some(p) => p,
         None => {
-            eprintln!("agentprov-rs: verify [--pubkey <hex>] [<path>] (no sessions recorded yet)");
+            eprintln!("agentprov-rs: verify [--pubkey <hex>] [--allow-unsigned] [<path>] (no sessions recorded yet)");
             process::exit(2);
         }
     };
@@ -352,12 +359,12 @@ fn cmd_verify(argv: &[String]) {
             }
             println!();
             if let Some(payload) = session_start_payload {
-                println!("SessionStart: {}", String::from_utf8_lossy(&payload));
+                println!("SessionStart: {}", sanitize_term(&String::from_utf8_lossy(&payload)));
             } else {
                 println!("SessionStart: (none)");
             }
             if let Some(payload) = session_end_payload {
-                println!("SessionEnd:   {}", String::from_utf8_lossy(&payload));
+                println!("SessionEnd:   {}", sanitize_term(&String::from_utf8_lossy(&payload)));
             } else {
                 println!("SessionEnd:   (none)");
             }
@@ -375,9 +382,14 @@ fn cmd_verify(argv: &[String]) {
 
             let sig = match sig {
                 Some(s) => s,
-                None => {
-                    println!("SIGNATURE: UNSIGNED — chain is consistent but not authenticated (no .sig)");
+                None if allow_unsigned => {
+                    println!("SIGNATURE: UNSIGNED — chain is consistent but not authenticated (no .sig; --allow-unsigned)");
                     process::exit(0);
+                }
+                None => {
+                    eprintln!("SIGNATURE: UNSIGNED — chain is consistent but not authenticated (no .sig)");
+                    eprintln!("  pass --allow-unsigned to accept a consistency-only check");
+                    process::exit(1);
                 }
             };
 
@@ -391,12 +403,20 @@ fn cmd_verify(argv: &[String]) {
             };
 
             let trusted_pub = match trusted_pub {
-                None => {
+                None if allow_unsigned => {
                     // No trusted anchor available: we cannot authenticate. Report
-                    // UNTRUSTED — never VALID off a bundled key alone.
-                    println!("SIGNATURE: UNTRUSTED — capture is signed but no trusted key to check it");
+                    // UNTRUSTED — never VALID off a bundled key alone. Exit status
+                    // is the machine contract, so this is non-zero unless the
+                    // caller explicitly accepted a consistency-only check.
+                    println!("SIGNATURE: UNTRUSTED — signed but no trusted key to check it (--allow-unsigned)");
                     println!("  pass --pubkey <hex> (obtained out-of-band) to authenticate off-machine");
                     process::exit(0);
+                }
+                None => {
+                    eprintln!("SIGNATURE: UNTRUSTED — signed but no trusted key to check it");
+                    eprintln!("  pass --pubkey <hex> (obtained out-of-band) to authenticate off-machine,");
+                    eprintln!("  or --allow-unsigned for a consistency-only check");
+                    process::exit(1);
                 }
                 Some(k) => k,
             };
@@ -468,7 +488,7 @@ fn cmd_cast(argv: &[String]) {
 // ---------------------------------------------------------------------------
 
 fn cmd_view(argv: &[String]) {
-    let (_pin, _allow, rest) = split_auth_flags(&argv[1..]);
+    let (pin, allow_unsigned, rest) = split_auth_flags(&argv[1..]);
     // The viewer is the original two-tab flight-recorder UI (viewer.html), which
     // is a matched pair with the Go viewer: it wants /chain (the semantic event
     // chain) + /cast (the real recording) tokenless. The Rust shim already
@@ -485,16 +505,34 @@ fn cmd_view(argv: &[String]) {
             }
         },
     };
-    // From an apcap path, the chain.jsonl sits beside it.
-    let chain = if apcap.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-        apcap.clone()
+    // Accept a session dir, a chain.jsonl, or a session.apcap. The signed
+    // capture is the authentication surface; the chain is only what gets served.
+    let (apcap, chain) = if apcap.is_dir() {
+        (apcap.join("session.apcap"), apcap.join("chain.jsonl"))
+    } else if apcap.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        (apcap.with_file_name("session.apcap"), apcap.clone())
     } else {
-        apcap.with_file_name("chain.jsonl")
+        (apcap.clone(), apcap.with_file_name("chain.jsonl"))
     };
     if !chain.exists() {
         eprintln!("agentprov: no chain.jsonl for this session at {}", chain.display());
         eprintln!("  (the session was recorded but its transcript chain wasn't built —");
         eprintln!("   only sessions captured through the installed shim have one.)");
+        process::exit(1);
+    }
+    // AUTH GATE: the viewer displays evidence, so it must agree with `verify`.
+    // Without a signed session.apcap beside the chain there is nothing to
+    // authenticate; refuse unless the caller explicitly opted into unverified.
+    if apcap.exists() {
+        gate_or_exit(&apcap, pin, allow_unsigned);
+    } else if allow_unsigned {
+        eprintln!("agentprov-rs: WARNING — no session.apcap beside {}; chain is UNVERIFIED", chain.display());
+    } else {
+        eprintln!(
+            "agentprov-rs: REFUSING — no signed session.apcap beside {}; \
+             pass --allow-unsigned to view the unverified chain",
+            chain.display()
+        );
         process::exit(1);
     }
     if let Err(e) = install::launch_flight_recorder(&chain) {
@@ -575,6 +613,29 @@ fn cmd_flows(argv: &[String]) {
     process::exit(0);
 }
 
+/// Make capture-derived text safe to print on a terminal. ESC (the start of
+/// OSC 52 clipboard writes and title/CSI sequences) and other C0/C1 controls are
+/// rendered visibly. Newlines/tabs are kept. Mirrors Go `sanitizeTerm`.
+fn sanitize_term(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\u{1b}' => out.push_str("\\x1b"),
+            c if (c as u32) < 0x20
+                || c == '\u{7f}'
+                || (('\u{80}'..='\u{9f}').contains(&c))
+                || (('\u{202a}'..='\u{202e}').contains(&c))
+                || (('\u{2066}'..='\u{2069}').contains(&c)) =>
+            {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Help / usage
 // ---------------------------------------------------------------------------
@@ -586,7 +647,7 @@ fn usage() {
     eprintln!("      Default --out is session.apcap in the current directory.");
     eprintln!("      Exits with the child's exit code.");
     eprintln!();
-    eprintln!("  agentprov-rs verify [--pubkey <hex>] <path>");
+    eprintln!("  agentprov-rs verify [--pubkey <hex>] [--allow-unsigned] <path>");
     eprintln!("      Verify the APCAP hash chain and the signed tip.");
     eprintln!("      Trust anchor: --pubkey (out-of-band) > machine keychain.");
     eprintln!("      The bundled .pub is never trusted on its own.");
@@ -726,6 +787,63 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(parse_run_args(&argv).is_err());
+    }
+
+    /// Build a minimal signed APCAP at `path` (frames + .pub/.sig sidecars).
+    fn make_signed_capture(dir: &Path, name: &str, signer: &Signing) -> PathBuf {
+        use agentprov_capture_format::{FrameType, Writer};
+        let path = dir.join(name);
+        let mut tip = [0u8; 32];
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            let mut w = Writer::new(f);
+            w.write(FrameType::SessionStart, 0, 0, b"claude").unwrap();
+            w.write(FrameType::PtyOutput, 1, 1, b"hello").unwrap();
+            w.write(FrameType::SessionEnd, 2, 2, b"exit=0").unwrap();
+        }
+        verify(BufReader::new(std::fs::File::open(&path).unwrap()), |fr| tip = fr.frame_hash).unwrap();
+        let (pp, sp) = sidecars(&path);
+        std::fs::write(&pp, integrity::to_hex(&signer.public_key())).unwrap();
+        std::fs::write(&sp, integrity::to_hex(&signer.sign_tip(&tip))).unwrap();
+        path
+    }
+
+    /// The `view` surface must run the SAME gate as cast/export. Regression:
+    /// cmd_view parsed --pubkey/--allow-unsigned and then ignored them, so a
+    /// re-forged capture was served as evidence.
+    #[test]
+    fn gate_refuses_forged_and_unsigned_capture() {
+        use agentprov_integrity::Signing;
+
+        let dir = std::env::temp_dir().join(format!("apcap-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let recorder = Signing::from_seed([11u8; 32]);
+        let pinned = recorder.public_key().to_vec();
+
+        let honest = make_signed_capture(&dir, "honest.apcap", &recorder);
+        assert!(gate(&honest, Some(pinned.clone()), false).is_ok());
+
+        // Unsigned: no .sig -> refused unless explicitly allowed.
+        let unsigned = make_signed_capture(&dir, "unsigned.apcap", &recorder);
+        let (_, unsigned_sig) = sidecars(&unsigned);
+        std::fs::remove_file(&unsigned_sig).unwrap();
+        assert!(gate(&unsigned, Some(pinned.clone()), false).is_err());
+        assert!(gate(&unsigned, Some(pinned.clone()), true).is_ok());
+
+        // Forged: re-signed with a fresh key. Never allowed, even with --allow-unsigned.
+        let forged = dir.join("forged.apcap");
+        std::fs::copy(&honest, &forged).unwrap();
+        let attacker = Signing::from_seed([12u8; 32]);
+        let mut tip = [0u8; 32];
+        verify(BufReader::new(std::fs::File::open(&forged).unwrap()), |fr| tip = fr.frame_hash).unwrap();
+        let (fpp, fsp) = sidecars(&forged);
+        std::fs::write(&fpp, integrity::to_hex(&attacker.public_key())).unwrap();
+        std::fs::write(&fsp, integrity::to_hex(&attacker.sign_tip(&tip))).unwrap();
+        assert!(gate(&forged, Some(pinned), false).is_err());
+        assert!(gate(&forged, None, true).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression: cast/view/export gate on `authenticate`, which must REFUSE a

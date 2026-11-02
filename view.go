@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -47,21 +48,39 @@ var fontBold []byte
 // box-drawing, powerline) that system fonts like Menlo render as blobs. Returns
 // "" if the write fails (agg then falls back to a system font).
 func fontDir() string {
-	dir := filepath.Join(os.TempDir(), "agentprov-fonts")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// Per-user cache dir, 0700, and create-if-absent with O_EXCL: a shared fixed
+	// path in $TMPDIR lets another local account pre-plant a symlink or a font
+	// that agg then loads.
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base = os.TempDir()
+	}
+	dir := filepath.Join(base, "agentprov", "fonts")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return ""
 	}
 	reg := filepath.Join(dir, "JetBrainsMono-Regular.ttf")
 	bold := filepath.Join(dir, "JetBrainsMono-Bold.ttf")
-	if _, err := os.Stat(reg); err != nil {
-		if os.WriteFile(reg, fontRegular, 0o644) != nil {
-			return ""
-		}
+	if !writeFontIfMissing(reg, fontRegular) {
+		return ""
 	}
-	if _, err := os.Stat(bold); err != nil {
-		_ = os.WriteFile(bold, fontBold, 0o644)
-	}
+	_ = writeFontIfMissing(bold, fontBold)
 	return dir
+}
+
+// writeFontIfMissing creates a font 0600 only if no entry exists. An existing
+// entry is accepted only if it is a regular file (never a symlink/device).
+func writeFontIfMissing(path string, data []byte) bool {
+	if fi, err := os.Lstat(path); err == nil {
+		return fi.Mode().IsRegular()
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return false
+	}
+	_, werr := f.Write(data)
+	cerr := f.Close()
+	return werr == nil && cerr == nil
 }
 
 // cmdDemo is the zero-install proof: write the bundled sample transcript, record
@@ -69,7 +88,7 @@ func fontDir() string {
 // it. Works with no Claude/Codex install and no transcript of their own.
 func cmdDemo() error {
 	const sample = "agentprov-sample.jsonl"
-	if err := os.WriteFile(sample, sampleTranscript, 0o600); err != nil {
+	if err := writeFileAtomic(sample, sampleTranscript, 0o600); err != nil {
 		return err
 	}
 	fmt.Print("agentprov demo — a tamper-evident record of a (sample) agent run.\n\n")
@@ -77,8 +96,8 @@ func cmdDemo() error {
 	if err := cmdRecord(sample); err != nil {
 		return err
 	}
-	fmt.Println("\n2. verifying the record:")
-	if err := cmdVerify("chain.jsonl"); err != nil {
+	fmt.Println("\n2. verifying the record (pinned to the public key this demo just wrote):")
+	if err := cmdVerifyWith("chain.jsonl", "chain.pub", false); err != nil {
 		return err
 	}
 	fmt.Println("\n3. now BREAK it — alter what the agent did, and watch verify fail:")
@@ -91,8 +110,8 @@ func cmdDemo() error {
 
 // cmdView serves the embedded viewer + the chain file on loopback and opens a
 // browser at it. Served (not file://) so the viewer can fetch the chain by URL.
-// The viewer is a pure renderer: it recomputes the same hash chain the CLI does,
-// so what you see in the browser is the real verification.
+// The viewer is a pure renderer: it recomputes the hash chain for consistency.
+// It has no key, so it does NOT verify signatures — the CLI does that.
 func cmdView(chainPath string) error { return cmdViewFlows(chainPath, "") }
 
 // renderVideo turns a .cast into a video by RE-RENDERING the recording's frames
@@ -121,10 +140,17 @@ func renderVideo(castPath, format string) (outPath, contentType string, err erro
 	if raw, e := os.ReadFile(castPath); e == nil {
 		cleaned := strings.ReplaceAll(string(raw), " ", " ")
 		if cleaned != string(raw) {
-			tmp := filepath.Join(os.TempDir(), "agentprov-render-"+base+".cast")
-			if os.WriteFile(tmp, []byte(cleaned), 0o600) == nil {
-				renderSrc = tmp
-				defer os.Remove(tmp)
+			// O_EXCL + a random name in the per-user temp dir: never a predictable
+			// shared path that a pre-planted symlink could redirect.
+			if tmpf, terr := os.CreateTemp("", "agentprov-render-*.cast"); terr == nil {
+				_, werr := tmpf.WriteString(cleaned)
+				cerr := tmpf.Close()
+				if werr == nil && cerr == nil {
+					renderSrc = tmpf.Name()
+					defer os.Remove(tmpf.Name())
+				} else {
+					os.Remove(tmpf.Name())
+				}
 			}
 		}
 	}
@@ -214,6 +240,42 @@ func cmdViewFlows(chainPath, flowsPath string) error {
 		fmt.Printf("agentprov: overlaying %d agentsnitch network flow(s) from %s\n", len(flows), flowsPath)
 	}
 
+	castPath := filepath.Join(filepath.Dir(abs), "session.cast")
+	mux := newViewerMux(abs, castPath, flowsJSON)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0") // loopback, OS-assigned port
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("http://%s/?chain=/chain", ln.Addr().String())
+	srv := &http.Server{
+		Handler:           viewerGuard(mux, viewerAllowedHosts(ln.Addr().String())),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+
+	fmt.Printf("agentprov view: %s\n", url)
+	fmt.Println("serving the flight-recorder viewer — press Ctrl-C to stop.")
+	go openBrowser(url)
+
+	// serve until interrupted
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Serve(ln) }()
+	sig := awaitInterrupt()
+	select {
+	case <-sig:
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return srv.Shutdown(ctx)
+	case err := <-errCh:
+		return err
+	}
+}
+
+// newViewerMux builds the viewer's routes. Kept separate from the server setup
+// so the Host/method guard can be tested with httptest.
+func newViewerMux(abs, castPath string, flowsJSON []byte) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/flows", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -240,7 +302,6 @@ func cmdViewFlows(chainPath, flowsPath string) error {
 		w.Write(asciinemaCSS)
 	})
 	// serve a .cast recording sitting next to the chain, if present.
-	castPath := filepath.Join(filepath.Dir(abs), "session.cast")
 	mux.HandleFunc("/cast", func(w http.ResponseWriter, r *http.Request) {
 		if _, err := os.Stat(castPath); err != nil {
 			http.NotFound(w, r)
@@ -250,7 +311,8 @@ func cmdViewFlows(chainPath, flowsPath string) error {
 		http.ServeFile(w, r, castPath)
 	})
 	// render the cast to a video server-side (agg/ffmpeg) and stream it back as
-	// a download — so the user clicks a button, no command, no screen capture.
+	// a download. POST-only + same-origin (enforced by viewerGuard) so a web page
+	// cannot drive a render through DNS rebinding.
 	mux.HandleFunc("/video", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("agentprov: rendering session video (agg/ffmpeg)…")
 		out, ct, err := renderVideo(castPath, "mp4")
@@ -267,30 +329,61 @@ func cmdViewFlows(chainPath, flowsPath string) error {
 		http.ServeFile(w, r, out)
 		fmt.Printf("agentprov: served %s\n", out)
 	})
+	return mux
+}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0") // loopback, OS-assigned port
-	if err != nil {
-		return err
+// viewerAllowedHosts is the exact Host allowlist for the loopback viewer.
+func viewerAllowedHosts(addr string) map[string]struct{} {
+	hosts := map[string]struct{}{addr: {}}
+	if _, port, err := net.SplitHostPort(addr); err == nil {
+		hosts["localhost:"+port] = struct{}{}
 	}
-	url := fmt.Sprintf("http://%s/?chain=/chain", ln.Addr().String())
-	srv := &http.Server{Handler: mux}
+	return hosts
+}
 
-	fmt.Printf("agentprov view: %s\n", url)
-	fmt.Println("serving the flight-recorder viewer — press Ctrl-C to stop.")
-	go openBrowser(url)
+// viewerGuard rejects DNS-rebinding/cross-site access to the loopback viewer.
+// Browsers send the attacker's hostname in Host when a page rebinds a name to
+// 127.0.0.1, so the allowlist closes that path; /video additionally requires
+// POST and a same-origin (or absent) Origin.
+func viewerGuard(next http.Handler, allowedHosts map[string]struct{}) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := allowedHosts[r.Host]; !ok {
+			http.Error(w, "forbidden: unexpected Host (viewer is loopback-only)", http.StatusForbidden)
+			return
+		}
+		if r.URL.Path == "/video" {
+			if r.Method != http.MethodPost {
+				w.Header().Set("Allow", http.MethodPost)
+				http.Error(w, "method not allowed: /video requires POST", http.StatusMethodNotAllowed)
+				return
+			}
+			if strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site") {
+				http.Error(w, "forbidden: cross-site request", http.StatusForbidden)
+				return
+			}
+			if origin := r.Header.Get("Origin"); origin != "" && !viewerOriginAllowed(origin, allowedHosts) {
+				http.Error(w, "forbidden: cross-origin request", http.StatusForbidden)
+				return
+			}
+		} else if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
 
-	// serve until interrupted
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Serve(ln) }()
-	sig := awaitInterrupt()
-	select {
-	case <-sig:
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		return srv.Shutdown(ctx)
-	case err := <-errCh:
-		return err
+func viewerOriginAllowed(origin string, allowedHosts map[string]struct{}) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme != "http" {
+		return false
 	}
+	_, ok := allowedHosts[u.Host]
+	return ok
 }
 
 func openBrowser(url string) {

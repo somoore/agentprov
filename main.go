@@ -9,14 +9,19 @@
 //   (2) GAP detection    — if the agent goes dark mid-run, the record shows the
 //                          discontinuity (missing recorder heartbeats) instead of
 //                          looking clean. The "agent shook its harness" signal.
-//   (3) NON-REPUDIATION  — the chain is signed by a key in the macOS keychain that
-//                          the agent process can't reach, so a popped agent can't
-//                          forge a chain that verifies.
+//   (3) SIGNED EVIDENCE  — the chain is signed with an ed25519 key held in the
+//                          macOS keychain. Verification is pinned to that key (or
+//                          an explicit --pubkey), never to a chain.pub that sits
+//                          next to the evidence. This raises the bar above a plain
+//                          log; it is NOT a boundary against same-user code: any
+//                          process running as you can read the keychain item.
 //
 // Commands:
 //   agentprov run -- <agent...>          # launch a real agent, record it LIVE, verify on exit
 //   agentprov record <transcript.jsonl>  # record a past transcript (claude/codex)
 //   agentprov verify <chain.jsonl>       # integrity + signatures + liveness + coverage
+//                                        #   --pubkey <hex|file> pins the trust anchor
+//                                        #   --allow-unsigned   consistency-only, loud
 //   agentprov view   [chain.jsonl]       # open the chain in a browser flight-recorder viewer
 //   agentprov tamper <chain.jsonl> <seq> # demo: alter one node  -> verify must fail
 //   agentprov drop   <chain.jsonl> <seq> # demo: delete one node -> verify must fail
@@ -89,11 +94,34 @@ func run(args []string) error {
 	case "hook-record": // invoked by the Claude Code SessionEnd hook (reads JSON on stdin)
 		return cmdHookRecord()
 	case "verify":
-		path := chainArgOrLatest(args[1:])
+		// Flags first; the remaining positional argument is the chain.
+		//   --pubkey <hex|file>  explicit out-of-band trust anchor
+		//   --allow-unsigned     consistency-only check, explicitly opted into
+		path := ""
+		anchorArg := ""
+		allowUnsigned := false
+		rest := args[1:]
+		for i := 0; i < len(rest); i++ {
+			switch rest[i] {
+			case "--pubkey":
+				if i+1 >= len(rest) {
+					return errors.New("--pubkey requires a hex key or a path to a .pub file")
+				}
+				anchorArg = rest[i+1]
+				i++
+			case "--allow-unsigned":
+				allowUnsigned = true
+			default:
+				path = rest[i]
+			}
+		}
+		if path == "" {
+			path = chainArgOrLatest(nil)
+		}
 		if path == "" {
 			return errors.New("no chain given and no recorded sessions found (run a session first, or pass a chain.jsonl)")
 		}
-		return cmdVerify(path)
+		return cmdVerifyWith(path, anchorArg, allowUnsigned)
 	case "video":
 		cast := "session.cast"
 		if len(args) > 1 {
@@ -125,8 +153,14 @@ func run(args []string) error {
 		}
 		return cmdViewFlows(path, flowsPath)
 	case "tamper":
+		if len(args) < 3 {
+			return errors.New("usage: agentprov tamper <chain.jsonl> <seq>")
+		}
 		return cmdMutate(args[1], args[2], false)
 	case "drop":
+		if len(args) < 3 {
+			return errors.New("usage: agentprov drop <chain.jsonl> <seq>")
+		}
 		return cmdMutate(args[1], args[2], true)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
@@ -137,7 +171,8 @@ func run(args []string) error {
 
 // Node is one link. Op="heartbeat" nodes are emitted by the RECORDER (not the
 // agent) on a cadence; their absence is how a gap becomes visible. Hash binds
-// content+PrevHash; Sig signs Hash with the keychain key the agent can't reach.
+// content+PrevHash; Sig signs Hash with the keychain key. Verification pins to
+// that key (or an explicit --pubkey) — a bundled chain.pub is never the anchor.
 type Node struct {
 	Seq        int               `json:"seq"`
 	Op         string            `json:"op"` // heartbeat | prompt | tool_call | tool_result | assistant | other
@@ -236,15 +271,33 @@ func keychainGet(service string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// keychainPublicKey derives the trust anchor from the keychain seed. It is the
+// only implicit anchor: a chain.pub next to the evidence is never trusted on its
+// own, because an attacker who can rewrite the chain can rewrite that file too.
+func keychainPublicKey() ed25519.PublicKey {
+	seedHex, err := keychainGet(keychainService)
+	if err != nil {
+		return nil
+	}
+	seed, err := hex.DecodeString(strings.TrimSpace(seedHex))
+	if err != nil || len(seed) != ed25519.SeedSize {
+		return nil
+	}
+	return ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
+}
+
 func keychainSet(service, secret string) error {
+	// Feed the command (and therefore the seed) on STDIN, never argv: argv is
+	// visible to same-user processes via ps for the lifetime of the call.
 	// -U updates if present. Stderr suppressed; we only care about exit status.
-	cmd := exec.Command("security", "add-generic-password", "-a", "agentprov", "-s", service, "-w", secret, "-U")
+	cmd := exec.Command("security", "-i")
+	cmd.Stdin = strings.NewReader(fmt.Sprintf("add-generic-password -a agentprov -s %s -w %s -U\n", service, secret))
 	cmd.Stderr = nil
 	return cmd.Run()
 }
 
-func writePubFile(pub ed25519.PublicKey) error {
-	return os.WriteFile("chain.pub", []byte(hex.EncodeToString(pub)), 0o644)
+func attachPubFile(pub ed25519.PublicKey, chainPath string) error {
+	return writePubFileAt(pub, filepath.Join(filepath.Dir(chainPath), "chain.pub"))
 }
 
 // ── live run: wrap a real agent ────────────────────────────────────────────
@@ -274,12 +327,12 @@ func cmdAttachCast(chainPath, castPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := writePubFile(pub); err != nil {
+	if err := attachPubFile(pub, chainPath); err != nil {
 		return err
 	}
 	// copy the recording next to the chain so the viewer can load it by name.
 	castName := "session.cast"
-	if err := os.WriteFile(castName, castBytes, 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(filepath.Dir(chainPath), castName), castBytes, 0o600); err != nil {
 		return err
 	}
 
@@ -338,11 +391,11 @@ func cmdAttachFlows(chainPath, flowsPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := writePubFile(pub); err != nil {
+	if err := attachPubFile(pub, chainPath); err != nil {
 		return err
 	}
 	flowName := "flows.jsonl"
-	if err := os.WriteFile(flowName, flowBytes, 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(filepath.Dir(chainPath), flowName), flowBytes, 0o600); err != nil {
 		return err
 	}
 
@@ -416,7 +469,7 @@ func runRecorded(args []string, outDir string, quiet bool) error {
 	}
 
 	chainPath := filepath.Join(outDir, "chain.jsonl")
-	out, err := os.Create(chainPath)
+	out, err := createEvidenceFile(chainPath)
 	if err != nil {
 		return err
 	}
@@ -490,7 +543,7 @@ func runRecorded(args []string, outDir string, quiet bool) error {
 			Summary: "real terminal recording (asciinema) — reconstruction's untrusted sibling",
 			Attrs: map[string]string{
 				"sha256": hex.EncodeToString(sum[:]),
-				"file":   castPath,
+				"file":   filepath.Base(castPath),
 				"bytes":  fmt.Sprintf("%d", len(castBytes)),
 				"key":    keySource,
 			},
@@ -524,7 +577,7 @@ func newSessionDir() string {
 
 // writePubFileAt writes the verify pubkey next to a chain.
 func writePubFileAt(pub ed25519.PublicKey, path string) error {
-	return os.WriteFile(path, []byte(hex.EncodeToString(pub)+"\n"), 0o600)
+	return writeFileAtomic(path, []byte(hex.EncodeToString(pub)+"\n"), 0o600)
 }
 
 // latestSessionDir returns the most recently modified recorded session dir, or
@@ -866,7 +919,7 @@ func recordTranscriptTo(path, outDir string, quiet bool) error {
 	}
 	_ = writePubFileAt(pub, filepath.Join(outDir, "chain.pub"))
 	chainPath := filepath.Join(outDir, "chain.jsonl")
-	out, err := os.Create(chainPath)
+	out, err := createEvidenceFile(chainPath)
 	if err != nil {
 		return err
 	}
@@ -906,6 +959,23 @@ func recordTranscriptTo(path, outDir string, quiet bool) error {
 	return nil
 }
 
+// validSessionID accepts the UUID-ish ids the harnesses emit and nothing that
+// can escape the sessions root when used as a path component.
+func validSessionID(id string) bool {
+	if id == "" || id == "." || id == ".." || len(id) > 128 {
+		return false
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // cmdHookRecord is invoked by the Claude Code SessionEnd hook. It reads the
 // hook's JSON from stdin — which gives us the EXACT transcript_path and
 // session_id, so there's zero transcript guessing — and records the signed
@@ -928,6 +998,12 @@ func cmdHookRecord() error {
 	id := in.SessionID
 	if id == "" {
 		id = fmt.Sprintf("hook-%d", time.Now().UnixNano()%1000000)
+	}
+	// The hook's JSON is written by the harness (and reachable by anything that
+	// can drive it), so session_id is untrusted input used as a path component.
+	// Reject separators, dot segments, and absurd lengths before joining.
+	if !validSessionID(id) {
+		return fmt.Errorf("hook record: invalid session_id %q (expected 1-128 chars of [A-Za-z0-9._-])", sanitizeTerm(id))
 	}
 	dir := filepath.Join(sessionsRoot(), id)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -1196,17 +1272,34 @@ func normalize(raw map[string]any) []Node {
 
 // ── verify ─────────────────────────────────────────────────────────────────
 
-func cmdVerify(path string) error {
+// cmdVerifyWith verifies a chain. Trust is anchored out-of-band: an explicit
+// --pubkey pin, or the machine keychain. A chain.pub next to the evidence is
+// only a consistency check — never the anchor — because an attacker who can
+// rewrite the chain can rewrite that file too. With no anchor we FAIL CLOSED and
+// return non-zero; --allow-unsigned is the explicit, loudly-reported opt-out for
+// a consistency-only inspection.
+func cmdVerifyWith(path, anchorArg string, allowUnsigned bool) error {
 	nodes, err := loadChain(path)
 	if err != nil {
 		return err
 	}
-	pub, _ := loadPub("chain.pub")
+	anchor, anchorSource, err := resolveTrustAnchor(anchorArg)
+	if err != nil {
+		return err
+	}
+	// A bundled .pub may not disagree with the trusted anchor. Resolve it next
+	// to the chain (never the CWD) and treat a malformed one as fatal.
+	if bpub, berr := loadPub(filepath.Join(filepath.Dir(path), "chain.pub")); berr == nil {
+		if anchor != nil && string(anchor) != string(bpub) {
+			return errors.New("TRUST ANCHOR MISMATCH: the chain.pub next to this record was signed by a different key than the trusted anchor — re-signed/forged evidence")
+		}
+	} else if !os.IsNotExist(berr) {
+		return fmt.Errorf("chain.pub next to the record is malformed: %w", berr)
+	}
 
 	prev := "GENESIS"
 	heartbeats := 0
 	cleanExit := false
-	keySource := "unknown"
 	var egress []string
 	var castNode *Node
 	var flowNode *Node
@@ -1227,17 +1320,14 @@ func cmdVerify(path string) error {
 			return fmt.Errorf("CHAIN BROKEN at seq %d: content ALTERED (recomputed %s != stored %s)",
 				n.Seq, short(want), short(n.Hash))
 		}
-		if pub != nil {
+		if anchor != nil {
 			sig, derr := hex.DecodeString(n.Sig)
-			if derr != nil || !ed25519.Verify(pub, []byte(n.Hash), sig) {
-				return fmt.Errorf("SIGNATURE INVALID at seq %d: not signed by the recorder key (forged, or re-hashed by something without the key)", n.Seq)
+			if derr != nil || len(sig) != ed25519.SignatureSize || !ed25519.Verify(anchor, []byte(n.Hash), sig) {
+				return fmt.Errorf("SIGNATURE INVALID at seq %d: not signed by the trusted %s key (forged, or re-hashed by something without the key)", n.Seq, anchorSource)
 			}
 		}
 		if n.Op == "heartbeat" {
 			heartbeats++
-			if k := n.Attrs["key"]; k != "" {
-				keySource = k
-			}
 			if strings.Contains(n.Summary, "clean exit") {
 				cleanExit = true
 			}
@@ -1251,23 +1341,123 @@ func cmdVerify(path string) error {
 		prev = n.Hash
 	}
 
-	fmt.Printf("integrity:  OK — %d nodes, chain intact, signatures valid. head: %s\n", len(nodes), short(prev))
-	if keySource == "keychain" {
-		fmt.Printf("provenance: signed by keychain key (non-repudiable: the agent process can't reach it)\n")
-	} else {
-		fmt.Printf("provenance: signed by %s key (tamper-evident; keychain unavailable -> not bound away from the agent)\n", keySource)
+	untrusted := anchor == nil && !allowUnsigned
+	switch {
+	case anchor != nil:
+		fmt.Printf("integrity:  OK — %d nodes, chain intact, all signatures verified against the %s anchor. head: %s\n",
+			len(nodes), anchorSource, short(prev))
+		fmt.Printf("provenance: signed by the %s key (tamper-evident; NOT a boundary against same-user code execution)\n", anchorSource)
+	case allowUnsigned:
+		fmt.Printf("integrity:  OK — %d nodes, chain intact. signatures: NOT CHECKED (no trust anchor; --allow-unsigned). head: %s\n", len(nodes), short(prev))
+		fmt.Printf("provenance: UNTRUSTED — consistency only; pass --pubkey <hex|file> to authenticate\n")
+	default:
+		fmt.Printf("integrity:  OK — %d nodes, chain intact. signatures: NOT CHECKED (no trust anchor). head: %s\n", len(nodes), short(prev))
+		fmt.Printf("provenance: UNTRUSTED — refusing to call this verified without an out-of-band key\n")
 	}
+	chainDir := filepath.Dir(path)
 	printNetwork(egress)
-	printCast(castNode)
-	printFlows(flowNode)
+	printCast(castNode, chainDir)
+	printFlows(flowNode, chainDir)
 	printCoverage()
 	if !cleanExit {
 		fmt.Printf("liveness:   ⚠ GAP DETECTED — no clean-exit heartbeat. The run was truncated or the recorder\n")
 		fmt.Printf("            was silenced mid-run. A plain log would look complete here; this does not.\n")
+	} else {
+		fmt.Printf("liveness:   OK — %d recorder heartbeats, clean exit observed.\n", heartbeats)
+	}
+	if untrusted {
+		return errors.New("verification UNTRUSTED: no trust anchor (pass --pubkey <hex|file>, or --allow-unsigned for a consistency-only check)")
+	}
+	if !cleanExit {
 		return errors.New("record incomplete: missing recorder clean-exit (possible evasion)")
 	}
-	fmt.Printf("liveness:   OK — %d recorder heartbeats, clean exit observed.\n", heartbeats)
 	return nil
+}
+
+// resolveTrustAnchor returns the key verification is pinned to, plus a label
+// safe to print. arg is --pubkey (hex or a file path). With no arg, the machine
+// keychain is the anchor; if it is absent, ok is nil and the caller fails closed.
+func resolveTrustAnchor(arg string) (ed25519.PublicKey, string, error) {
+	if arg != "" {
+		if p, err := parsePubHex(arg); err == nil {
+			return p, "--pubkey", nil
+		}
+		p, err := loadPub(arg)
+		if err != nil {
+			return nil, "", fmt.Errorf("--pubkey: %w", err)
+		}
+		return p, "explicit --pubkey", nil
+	}
+	if p := keychainPublicKey(); p != nil {
+		return p, "keychain", nil
+	}
+	return nil, "", nil
+}
+
+// maxEvidenceBytes caps what verify will hash from a chain-declared evidence
+// file. A hostile chain must not be able to make verify read a device or an
+// unbounded file.
+const maxEvidenceBytes = 64 << 20
+
+// safeEvidencePath resolves a filename declared by the chain against the chain's
+// own directory. Absolute paths and traversal are rejected, and non-regular
+// files (FIFOs, devices) are refused so verify cannot block or read anything the
+// chain author did not leave beside the evidence.
+func safeEvidencePath(chainDir, name string) (string, error) {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") && !filepath.IsAbs(name) {
+		return "", fmt.Errorf("refusing chain-declared path %q (must name a file beside the chain)", sanitizeTerm(name))
+	}
+	absDir, derr := filepath.Abs(chainDir)
+	if derr != nil {
+		return "", derr
+	}
+	p := name
+	if !filepath.IsAbs(name) {
+		p = filepath.Join(chainDir, name)
+	}
+	absName, aerr := filepath.Abs(p)
+	if aerr != nil {
+		return "", aerr
+	}
+	// Absolute paths are accepted only when they resolve to the chain's own
+	// directory. Anything else (device, /etc/passwd, ../../x) is refused.
+	p = absName
+	if filepath.Dir(p) != absDir {
+		return "", fmt.Errorf("refusing chain-declared path %q (outside the chain directory)", sanitizeTerm(name))
+	}
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return "", err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("refusing non-regular evidence file %q", sanitizeTerm(name))
+	}
+	if fi.Size() > maxEvidenceBytes {
+		return "", fmt.Errorf("evidence file %q exceeds %d bytes", sanitizeTerm(name), maxEvidenceBytes)
+	}
+	return p, nil
+}
+
+// sanitizeTerm makes chain-derived text safe to print on a terminal: control
+// characters (notably ESC, which starts OSC 52 clipboard writes and title/CSI
+// sequences) are rendered visibly instead of being interpreted. Newlines and
+// tabs are kept.
+func sanitizeTerm(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\t':
+			b.WriteRune(r)
+		case r == 0x1b:
+			b.WriteString(`\x1b`)
+		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f),
+			r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // printNetwork lists the egress the agent did through its OWN tools (WebFetch,
@@ -1281,7 +1471,7 @@ func printNetwork(egress []string) {
 		return
 	}
 	for _, e := range egress {
-		fmt.Println("  → " + e)
+		fmt.Println("  → " + sanitizeTerm(e))
 	}
 }
 
@@ -1291,7 +1481,7 @@ func printNetwork(egress []string) {
 // chain committed to. The recording is the untrusted sibling of the verified
 // replay — it can show whatever the agent rendered to the TTY — but the chain
 // commits to its SHA-256, so a swapped recording is caught here.
-func printCast(n *Node) {
+func printCast(n *Node, chainDir string) {
 	if n == nil {
 		return
 	}
@@ -1300,19 +1490,24 @@ func printCast(n *Node) {
 	if file == "" {
 		file = "session.cast"
 	}
-	data, err := os.ReadFile(file)
+	path, perr := safeEvidencePath(chainDir, file)
+	if perr != nil {
+		fmt.Printf("recording:  ⚠ not inspected — %v\n", perr)
+		return
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Printf("recording:  ⚠ committed (%s) but %s not found — recording missing\n", short(committed), file)
+		fmt.Printf("recording:  ⚠ committed (%s) but %s not found — recording missing\n", sanitizeTerm(short(committed)), sanitizeTerm(file))
 		return
 	}
 	sum := sha256.Sum256(data)
 	got := hex.EncodeToString(sum[:])
 	if got != committed {
-		fmt.Printf("recording:  ✗ ALTERED — %s no longer matches the hash the chain committed to\n", file)
-		fmt.Printf("            committed %s, on disk %s. The recording was swapped after the run.\n", short(committed), short(got))
+		fmt.Printf("recording:  ✗ ALTERED — %s no longer matches the hash the chain committed to\n", sanitizeTerm(file))
+		fmt.Printf("            committed %s, on disk %s. The recording was swapped after the run.\n", sanitizeTerm(short(committed)), short(got))
 		return
 	}
-	fmt.Printf("recording:  ✓ real terminal recording present and matches the chain (%s)\n", file)
+	fmt.Printf("recording:  ✓ real terminal recording present and matches the chain (%s)\n", sanitizeTerm(file))
 	fmt.Printf("            note: this is the agent's self-rendered TTY — watchable ground truth, but\n")
 	fmt.Printf("            NOT forgery-proof. The verified replay above is. Cross-check the two.\n")
 }
@@ -1321,7 +1516,7 @@ func printCast(n *Node) {
 // hash. The flows are OS-observed egress (a third evidence layer); committing
 // the hash makes the overlay swap-proof, but the flows — and agentsnitch's
 // probabilistic tool links — stay OUT of the signed chain.
-func printFlows(n *Node) {
+func printFlows(n *Node, chainDir string) {
 	if n == nil {
 		return
 	}
@@ -1330,18 +1525,23 @@ func printFlows(n *Node) {
 	if file == "" {
 		file = "flows.jsonl"
 	}
-	data, err := os.ReadFile(file)
+	path, perr := safeEvidencePath(chainDir, file)
+	if perr != nil {
+		fmt.Printf("flows:      ⚠ not inspected — %v\n", perr)
+		return
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Printf("flows:      ⚠ committed (%s) but %s not found — flow evidence missing\n", short(committed), file)
+		fmt.Printf("flows:      ⚠ committed (%s) but %s not found — flow evidence missing\n", sanitizeTerm(short(committed)), sanitizeTerm(file))
 		return
 	}
 	sum := sha256.Sum256(data)
 	got := hex.EncodeToString(sum[:])
 	if got != committed {
-		fmt.Printf("flows:      ✗ ALTERED — %s no longer matches the committed hash (swapped after the run)\n", file)
+		fmt.Printf("flows:      ✗ ALTERED — %s no longer matches the committed hash (swapped after the run)\n", sanitizeTerm(file))
 		return
 	}
-	fmt.Printf("flows:      ✓ OS-observed network flows present and match the chain (%s, %s flows)\n", file, n.Attrs["flows"])
+	fmt.Printf("flows:      ✓ OS-observed network flows present and match the chain (%s, %s flows)\n", sanitizeTerm(file), sanitizeTerm(n.Attrs["flows"]))
 	fmt.Printf("            note: flows are a FACT (real sockets); the tool<->flow links are agentsnitch's\n")
 	fmt.Printf("            probabilistic correlation (confidence-labeled), not agentprov's verdict.\n")
 }
@@ -1416,7 +1616,7 @@ func loadChain(path string) ([]Node, error) {
 }
 
 func writeChain(path string, nodes []Node) error {
-	out, err := os.Create(path)
+	out, err := createEvidenceFile(path)
 	if err != nil {
 		return err
 	}
@@ -1431,16 +1631,75 @@ func writeChain(path string, nodes []Node) error {
 	return nil
 }
 
+// loadPub reads and validates a hex-encoded ed25519 public key. The length
+// check is load-bearing: ed25519.Verify panics on a key that is not exactly 32
+// bytes, and a truncated/malformed .pub is ordinary untrusted input here.
 func loadPub(path string) (ed25519.PublicKey, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	raw, err := hex.DecodeString(strings.TrimSpace(string(b)))
+	pub, err := parsePubHex(string(b))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return pub, nil
+}
+
+func parsePubHex(s string) (ed25519.PublicKey, error) {
+	raw, err := hex.DecodeString(strings.TrimSpace(s))
+	if err != nil {
+		return nil, fmt.Errorf("not hex: %w", err)
+	}
+	if len(raw) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("ed25519 public key must be %d bytes, got %d", ed25519.PublicKeySize, len(raw))
+	}
+	return ed25519.PublicKey(raw), nil
+}
+
+// createEvidenceFile creates a chain file 0600. Chains contain verbatim prompts
+// and tool output (often secrets), so they are never group/world readable. The
+// chmod also tightens files created by older versions with the umask default.
+func createEvidenceFile(path string) (*os.File, error) {
+	// Refuse to open through a pre-existing symlink: an agent that controls the
+	// working tree could plant one and redirect the evidence write.
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("refusing to write evidence through symlink %s", path)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	return ed25519.PublicKey(raw), nil
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// writeFileAtomic writes via a temp file in the destination directory and
+// renames it into place. Rename replaces a symlink itself rather than following
+// it, so a pre-planted link cannot redirect the write.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".agentprov-tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name) // no-op after a successful rename
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 func short(s string) string {

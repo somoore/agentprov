@@ -39,8 +39,9 @@ forensic record, and the anomaly sensor in one structure.
 - Threat model v1: **honest-but-injectable agent.** Unprivileged, consumes native surfaces
   (Claude OTel spans, Codex events, on-disk JSONL transcripts, hooks, optional MCP proxy).
   Root-level ES/eBPF is a higher-assurance *backend tier*, pulled by demand — NOT v1.
-- Tamper-evidence = **Merkle/hash chain** locally; **sign checkpoints** with a key the agent
-  can't reach (keychain/TPM) = non-repudiation against a popped agent; OPTIONAL
+- Tamper-evidence = **Merkle/hash chain** locally; **sign checkpoints** with a key outside the
+  agent's transcript surface (keychain/TPM; a privileged signer is needed for a true same-user
+  boundary) = tamper-evidence against a popped agent; OPTIONAL
   transparency-log anchoring (RFC3161 / Rekor-style) of Merkle roots for third-party-provable
   timestamps. **NO blockchain** — deliberately, and saying why is a credibility signal.
 - Standard posture: **extend OTel** (`gen_ai.*`, `execute_tool`, MCP spans) for plumbing;

@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 
 use agentprov_integrity::{to_hex, Signing};
@@ -647,8 +648,10 @@ pub fn record_transcript_with_cast(
     let _probe = File::open(transcript_path)?;
     drop(_probe);
 
-    // Ensure the output dir exists (the shim points at a fresh session dir).
-    std::fs::create_dir_all(out_dir)?;
+    // Ensure the output dir exists 0700 (the shim points at a fresh session dir).
+    let mut db = std::fs::DirBuilder::new();
+    db.recursive(true).mode(0o700);
+    db.create(out_dir)?;
 
     let signer = Signing::load_or_create();
     let key_source = match signer.source {
@@ -659,7 +662,13 @@ pub fn record_transcript_with_cast(
     // chain.pub: hex(pub)+"\n", matching Go writePubFileAt.
     std::fs::write(out_dir.join("chain.pub"), format!("{}\n", to_hex(&signer.public_key())))?;
 
-    let out = File::create(out_dir.join("chain.jsonl"))?;
+    // Chain content is verbatim prompt/tool output: never group/world readable.
+    let out = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(out_dir.join("chain.jsonl"))?;
     let mut rec = Recorder::new(BufWriter::new(out), &signer);
 
     let mut start_attrs = BTreeMap::new();
@@ -775,6 +784,22 @@ mod tests {
         let p = dir.join("transcript.jsonl");
         std::fs::write(&p, SYNTH).unwrap();
         p
+    }
+
+    #[test]
+    fn chain_and_session_dir_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("apchain-perms-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let t = write_synth(&tmp);
+        let out = tmp.join("out");
+        record_transcript(&t, &out).unwrap();
+
+        let chain_mode = std::fs::metadata(out.join("chain.jsonl")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(chain_mode, 0o600, "chain.jsonl must be 0600, got {chain_mode:o}");
+        let dir_mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "session dir must be 0700, got {dir_mode:o}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

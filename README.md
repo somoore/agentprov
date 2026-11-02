@@ -21,8 +21,10 @@ altered, truncated, or silenced, and the gap looks identical to "the user went t
 - **Tamper-evident** — every event is hash-chained. Alter or delete one and verification fails.
 - **Gap-detecting** — the recorder emits its own heartbeats. If the agent goes dark mid-run,
   the record shows the discontinuity. *A plain log would look complete here; this doesn't.*
-- **Non-repudiable** — the chain is signed by a key in the macOS keychain the agent process
-  can't reach. A compromised agent can't forge a chain that verifies.
+- **Signed** — the chain is signed with an ed25519 key in the macOS keychain, and `verify`
+  pins to that key (or an explicit `--pubkey`). A standalone `chain.pub` beside the evidence
+  is never trusted, and a missing anchor fails closed. This raises the bar; it is **not** a
+  boundary against same-user code execution (any process running as you can read the keychain).
 
 It's unprivileged, single-binary, and honest about its blind spots (see Coverage).
 
@@ -63,13 +65,19 @@ agentprov: recorded 25 nodes (23 agent events) -> chain.jsonl
 
 ```bash
 $ agentprov verify chain.jsonl
-integrity:  OK — 25 nodes, chain intact, signatures valid. head: 9fdb44aab62b
-provenance: signed by keychain key (non-repudiable: the agent process can't reach it)
+integrity:  OK — 25 nodes, chain intact, all signatures verified against the keychain anchor. head: 9fdb44aab62b
+provenance: signed by the keychain key (tamper-evident; NOT a boundary against same-user code execution)
 coverage:
   ✓ covered  : prompts, tool calls, tool results, run start/end (agent self-reported transcript)
   ✗ blindspot: off-transcript subprocess egress, raw sockets, file writes by spawned children
 liveness:   OK — 2 recorder heartbeats, clean exit observed.
 ```
+
+`verify` pins to the machine keychain by default and **fails closed** if that anchor is
+unavailable. Off-machine (or on a host without the keychain item), pass the key out-of-band:
+`agentprov verify --pubkey <hex|path-to-chain.pub> chain.jsonl`. A `chain.pub` sitting next to
+the evidence is never used as the anchor by itself; `--allow-unsigned` gives a loud,
+consistency-only check.
 
 **2. Tamper with it → caught.** Alter any recorded event:
 
@@ -93,7 +101,7 @@ clean-exit heartbeat is missing — so `verify` flags it as a gap a plain log wo
 ```bash
 $ sed '$d' chain.jsonl > truncated.jsonl     # simulate the run being silenced
 $ agentprov verify truncated.jsonl
-integrity:  OK — chain intact, signatures valid.
+integrity:  OK — chain intact, all signatures verified against the keychain anchor.
 liveness:   ⚠ GAP DETECTED — no clean-exit heartbeat. The run was truncated or the recorder
             was silenced mid-run. A plain log would look complete here; this does not.
 ```

@@ -8,6 +8,7 @@
 //! and make the shim FAIL-OPEN — if agentprov is missing it execs real claude,
 //! so claude never breaks because of the recorder.
 
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -170,7 +171,9 @@ pub fn shim(args: &[String]) -> i32 {
     let root = sessions_root();
     let id = session_id();
     let dir = root.join(&id);
-    if std::fs::create_dir_all(&dir).is_err() {
+    let mut db = std::fs::DirBuilder::new();
+    db.recursive(true).mode(0o700);
+    if db.create(&dir).is_err() && !dir.is_dir() {
         return exec_real(&real, &orig_args);
     }
     let apcap = dir.join("session.apcap");
@@ -212,7 +215,13 @@ pub fn shim(args: &[String]) -> i32 {
     // tab + video render. Best-effort, silent.
     let cast = dir.join("session.cast");
     if let Ok(apcap_f) = std::fs::File::open(&apcap) {
-        if let Ok(cast_f) = std::fs::File::create(&cast) {
+        if let Ok(cast_f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&cast)
+        {
             let _ = agentprov_replay_core::to_asciicast(
                 std::io::BufReader::new(apcap_f),
                 std::io::BufWriter::new(cast_f),
@@ -336,12 +345,10 @@ pub fn launch_flight_recorder(chain: &Path) -> Result<(), String> {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    // Candidate names for the Go viewer binary.
-    let candidates = [
-        self_dir.join("agentprov.go-old"),
-        self_dir.join("agentprov-go"),
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("github/agentprov/agentprov"),
-    ];
+    // Candidate names for the Go viewer binary — resolved ONLY from this
+    // install prefix. No hard-coded $HOME/... fallback: a stale or planted file
+    // there would otherwise be executed on `view`.
+    let candidates = [self_dir.join("agentprov.go-old"), self_dir.join("agentprov-go")];
     let go = candidates.iter().find(|p| p.is_file()).ok_or_else(|| {
         format!(
             "the flight-recorder viewer (Go binary) was not found.\n  Looked in: {}\n  Build it: cd <agentprov repo> && go build -o ~/.local/bin/agentprov.go-old .",

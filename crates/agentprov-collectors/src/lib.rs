@@ -15,6 +15,8 @@
 //! alongside a capture, the flows are a separate evidence layer, weaker than
 //! the signed APCAP chain.
 
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -272,11 +274,19 @@ impl EvidenceSink for LocalDirectorySink {
     }
 
     fn finalize(&mut self) -> std::io::Result<()> {
-        // Ensure the target dir exists — the caller may point at a fresh path.
-        std::fs::create_dir_all(&self.dir)?;
+        // Ensure the target dir exists 0700 — the caller may point at a fresh path.
+        let mut db = std::fs::DirBuilder::new();
+        db.recursive(true).mode(0o700);
+        db.create(&self.dir)?;
         // Write flows.jsonl — one Flow per line, matching JSONL convention.
+        // Flow evidence includes hostnames/ports: create it 0600.
         let jsonl_path = self.dir.join("flows.jsonl");
-        let mut f = std::fs::File::create(&jsonl_path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&jsonl_path)?;
         for flow in &self.flows {
             let line = serde_json::to_vec(flow)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
