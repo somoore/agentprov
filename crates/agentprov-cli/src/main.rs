@@ -841,7 +841,11 @@ mod tests {
         std::fs::write(&fpp, integrity::to_hex(&attacker.public_key())).unwrap();
         std::fs::write(&fsp, integrity::to_hex(&attacker.sign_tip(&tip))).unwrap();
         assert!(gate(&forged, Some(pinned), false).is_err());
-        assert!(gate(&forged, None, true).is_err());
+        // A re-signed capture is refused even with --allow-unsigned whenever a
+        // trust anchor exists. With no anchor at all the capture is merely
+        // "untrusted" (never silently "valid"), which the CLI reports loudly.
+        let third_party = Signing::from_seed([13u8; 32]).public_key().to_vec();
+        assert!(gate(&forged, Some(third_party), true).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
